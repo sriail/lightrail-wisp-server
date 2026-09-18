@@ -1,0 +1,13 @@
+# wrangler.toml
+name = "bare-js-wisp-server"
+main = "src/server/index.js"
+compatibility_date = "2023-08-01"
+
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "./src"
+binding = "ASSETS"
+
+[observability]
+enabled = true

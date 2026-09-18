@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0", "toml"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["wisp", "wisp.server"]
+package-dir = {"" = "src"}
+
+[project]
+name = "Lightrail Wisp Server"
+version = "0.9.0"
+description = "An implementation of a Wisp proxy server in Python"
+requires-python = ">=3.9"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: GNU Affero General Public License v3",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "websockets",
+  "asyncudp",
+  "python-socks[asyncio]",
+  "uvloop; sys_platform != 'win32' and sys_platform != 'cygwin'",
+  "winloop; sys_platform == 'win32' or sys_platform == 'cygwin'"
+]
+
