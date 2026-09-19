@@ -1,13 +1,16 @@
-# wrangler.toml
-name = "bare-js-wisp-server"
-main = "src/server/index.js"
-compatibility_date = "2023-08-01"
+name = "lightrail-wisp-server"
+type = "python"
+main = "src/worker.py"
+compatibility_date = "2024-12-16"
+compatibility_flags = ["python_workers"]
 
-compatibility_flags = ["nodejs_compat"]
+vars = { 
+ # Add a tunnel for UDP Support
+ # TUNNEL_URL = "https://PRODUCTION-TUNNEL-URL",
+  LOG_LEVEL = "info"
+}
 
-[assets]
-directory = "./src"
-binding = "ASSETS"
+[env.production]
+routes = [{ pattern = "wisp.example.com/wisp/*", zone_name = "example.com" }]
+# vars = { TUNNEL_URL = "https://PRODUCTION-TUNNEL-URL" }
 
-[observability]
-enabled = true
