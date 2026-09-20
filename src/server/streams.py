@@ -97,7 +97,15 @@ class TCPStream:
             return
 
         try:
+            from js import console
             sockets = load_tcp_module()
+            
+            # ✨ DIAGNOSTIC: Log connection attempt
+            console.log(
+                f"[wisp-tcp] Attempting connection to {self.hostname}:{self.port} "
+                f"(stream_id={self.stream_id}, timeout={timeout}s)"
+            )
+            
             address = to_js(
                 {"hostname": self.hostname, "port": self.port},
                 dict_converter=Object.fromEntries,
@@ -114,6 +122,12 @@ class TCPStream:
             )
 
             await asyncio.wait_for(self.socket.opened, timeout=timeout)
+            
+            # ✨ DIAGNOSTIC: Log successful connection
+            console.log(
+                f"[wisp-tcp] Successfully established TCP connection to {self.hostname}:{self.port} "
+                f"(stream_id={self.stream_id})"
+            )
 
             self.writer = self.socket.writable.getWriter()
             self.reader = self.socket.readable.getReader()
@@ -224,15 +238,21 @@ class TCPStream:
     @staticmethod
     def _classify_error(exc: BaseException) -> int:
         text = str(exc).lower()
+        
+        # TLS handshake failures (e.g., from Epoxy WASM)
+        if "tls" in text or "handshake" in text or "eof" in text:
+            # Could be: unsupported TLS version, wrong cipher, timeout, or HTTP vs HTTPS mismatch
+            return 0x03  # CLOSE_NETWORK_ERROR
+        
         if isinstance(exc, asyncio.TimeoutError) or "timeout" in text:
-            return 0x43
+            return 0x43  # CLOSE_TIMEOUT
         if "refused" in text or "econnrefused" in text:
-            return 0x44
+            return 0x44  # CLOSE_REFUSED
         if "resolve" in text or "not found" in text or "dns" in text:
-            return 0x42
+            return 0x42  # CLOSE_UNREACHABLE
         if "disallowed" in text or "private" in text:
-            return 0x48
-        return 0x03
+            return 0x48  # CLOSE_BLOCKED
+        return 0x03  # CLOSE_NETWORK_ERROR
 
     def send_data(self, payload: bytes) -> None:
         from server.connection import DATA, build_packet
