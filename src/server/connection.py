@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
-from collections.abc import Awaitable, Callable
-from urllib.parse import urlsplit
 
-from js import WebSocketPair, console
+from js import console
 from pyodide.ffi import create_proxy, to_js
 
 from server.net import StreamTable
@@ -169,10 +167,17 @@ class WispConnection:
         self._connect_timestamps: list[float] = []
 
     def start(self) -> None:
-        """Accept the WebSocket and install event listeners."""
+        """Backward-compatible full setup: accept, then install handlers."""
         self.websocket.binaryType = "arraybuffer"
-        self.websocket.accept({"allowHalfOpen": True})
+        self.websocket.accept()
+        self.install_after_accept()
 
+    def install_after_accept(self) -> None:
+        """Install handlers and send the initial Wisp v1 CONTINUE packet.
+
+        The caller must have already called WebSocket.accept(). This split keeps
+        the HTTP 101 upgrade path identical to Cloudflare's native examples.
+        """
         message_proxy = create_proxy(self._on_message)
         close_proxy = create_proxy(self._on_close)
         error_proxy = create_proxy(self._on_error)

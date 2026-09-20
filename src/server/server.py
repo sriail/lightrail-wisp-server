@@ -2,33 +2,40 @@
 
 from __future__ import annotations
 
-from js import console
-from workers import Response
-
+from js import Response as JSResponse, WebSocketPair, console
 from page import html_response
 from server.connection import WispConnection
 from server.rates import WEBSOCKET_PATH_MUST_END_WITH_SLASH
 
 
 class WispServer:
-    """Route ordinary HTTP requests and Wisp WebSocket upgrades."""
+    """Route normal HTTP requests and Wisp WebSocket upgrades."""
 
     def __init__(self, _env=None):
         self.env = _env
 
     async def handle(self, request):
         path = self._path(request.url)
-        upgrade = (request.headers.get("Upgrade") or "").lower()
 
         if request.method != "GET":
-            return Response("GET is required.", status=405, headers={"Allow": "GET"})
+            return JSResponse.new(
+                "GET is required.",
+                status=405,
+                headers={"Allow": "GET"},
+            )
+
+        upgrade = (request.headers.get("Upgrade") or "").strip().lower()
 
         if upgrade == "websocket":
             if WEBSOCKET_PATH_MUST_END_WITH_SLASH and not path.endswith("/"):
-                return Response("Wisp WebSocket endpoint must end with '/'.", status=400)
-            return self.upgrade(request)
+                return JSResponse.new(
+                    "Wisp WebSocket endpoint must end with '/'.",
+                    status=400,
+                    headers={"Content-Type": "text/plain; charset=utf-8"},
+                )
 
-        # Ordinary browser/user visits receive the static placeholder page.
+            return self._upgrade(request)
+
         return html_response()
 
     @staticmethod
@@ -39,10 +46,28 @@ class WispServer:
             return "/"
 
     @staticmethod
-    def upgrade(request):
-        pair = WebSocketPair.new().object_values()
-        client, server = pair
+    def _upgrade(request):
+        # Match Cloudflare's documented Python WebSocket pattern:
+        # create a pair, accept the server side, then return a native JS
+        # 101 Response containing the client side.
+        upgrade = (request.headers.get("Upgrade") or "").strip().lower()
+        if upgrade != "websocket":
+            return JSResponse.new(
+                "Expected Upgrade: websocket",
+                status=426,
+                headers={"Content-Type": "text/plain; charset=utf-8"},
+            )
+
+        client, server = WebSocketPair.new().object_values()
+
+        # Binary Wisp packets must arrive as ArrayBuffer rather than Blob.
+        server.binaryType = "arraybuffer"
+        server.accept()
+
+        # Keep the Wisp connection object alive through its JS callback proxies.
         connection = WispConnection(server)
-        connection.start()
-        console.log("[wisp] HTTP Upgrade -> WebSocket complete")
-        return Response(None, status=101, web_socket=client)
+        connection.install_after_accept()
+
+        console.log("[wisp] WebSocket 101 upgrade accepted")
+
+        return JSResponse.new(None, status=101, webSocket=client)

@@ -1,16 +1,11 @@
-from workers import WorkerEntrypoint, Response
-from page import html_response
+"""Cloudflare Python Worker entry point."""
+
+from workers import WorkerEntrypoint
+from server.server import WispServer
 
 
 class Default(WorkerEntrypoint):
+    """Bridge between Cloudflare's fetch handler and the Wisp server."""
+
     async def fetch(self, request):
-        upgrade = (request.headers.get("Upgrade") or "").lower()
-
-        # Normal browser request.
-        if upgrade != "websocket":
-            return html_response()
-
-        # Only load the Wisp/WebSocket implementation when it is actually needed.
-        from server.server import WispServer
-
         return await WispServer(self.env).handle(request)

@@ -8,19 +8,12 @@ _HTML = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>lightrail-wisp-server</title>
+  <title>Wisp Python Worker</title>
 </head>
 <body>
-  <h1>Lightrail Wisp Server</h1>
+  <h1>Wisp Python Worker</h1>
   <p>This endpoint accepts Wisp v1 WebSocket connections.</p>
-  <p>Use the trailing-slash WebSocket endpoint, for example: 
-    <code id="wss-relay">wss://...</code>
-  </p>
-  <script>
-    const domainName = window.location.hostname;
-    const wssUrl = `wss://${domainName}/`;
-    document.getElementById("wss-relay").textContent = wssUrl;
-  </script> 
+  <p>Use the trailing-slash WebSocket endpoint, for example <code>wss://example.com/</code>.</p>
 </body>
 </html>
 """
