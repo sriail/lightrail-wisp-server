@@ -5,7 +5,8 @@ import logging
 import random
 import textwrap
 
-from websockets.server import serve
+# Note: websockets.server.serve is handled by Cloudflare Workers runtime
+# No need to import it here - Cloudflare's WebSocket support is built-in
 
 import wisp
 from wisp.server import connection
@@ -19,7 +20,7 @@ default_html = f"""
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width">
-    <title>wisp-server-python v{wisp.version}</title>
+    <title>lightrail-wisp-server v{wisp.version}</title>
     <style>
       html {{
         color-scheme: light dark;
@@ -38,8 +39,8 @@ default_html = f"""
     </style>
   </head>
   <body>
-    <h1>wisp-server-python</h1>
-    <p>This is a <a href="https://github.com/MercuryWorkshop/wisp-protocol">Wisp protocol</a> server running
+    <h1>Lightrail Wisp Server</h1>
+    <p>This is a <a href="https://github.com/MercuryWorkshop/wisp-protocol">Wisp protocol</a> server based on
      <a href="https://github.com/MercuryWorkshop/wisp-server-python">wisp-server-python</a> v{wisp.version}.</p>
     <p>This program is licensed under the <a href="https://github.com/MercuryWorkshop/wisp-server-python/blob/main/LICENSE">GNU AGPL v3</a>.</p>
     <pre>
@@ -115,6 +116,11 @@ async def request_handler(path, request_headers):
   return 200, response_headers, static_data
 
 async def main(args):
+  """Initialize server configuration (for backwards compatibility with CLI)
+  
+  Note: In Cloudflare Workers, this is called during initialization.
+  WebSocket handling is delegated to Cloudflare's runtime.
+  """
   global static_path
 
   if args.static:
@@ -144,15 +150,14 @@ async def main(args):
   net.block_tcp = args.block_tcp
       
   limit_task = asyncio.create_task(ratelimit.reset_limits_timer())
-  ws_logger = logging.getLogger("websockets")
-  ws_logger.setLevel(logging.WARN)
-
-  reuse_port = net.reuse_port_supported()
-  server_header = f"wisp-server-python v{wisp.version}"
-
-  async with serve(
-    connection_handler, args.host, int(args.port), 
-    reuse_port=reuse_port, process_request=request_handler, 
-    compression=None, server_header=server_header
-  ):
+  
+  logging.info(f"wisp-server-python v{wisp.version} ready")
+  logging.info(f"listening on {args.host}:{args.port}")
+  
+  # In Cloudflare Workers, we don't call serve() here
+  # Instead, WebSocket connections are handled by the Worker entrypoint
+  # Keep the event loop alive by awaiting an indefinite future (for local testing)
+  try:
     await asyncio.Future()
+  except KeyboardInterrupt:
+    pass

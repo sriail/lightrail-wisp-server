@@ -1,14 +1,13 @@
 name = "lightrail-wisp-server"
 main = "src/entry.py"
- 
 compatibility_date = "2026-09-20"
+compatibility_flags = ["python_workers"]
 
 [observability]
 enabled = false
 
-[assets]
-directory = "./src"
-binding = "ASSETS"
-html_handling = "force-trailing-slash"
-not_found_handling = "404-page"
-
+[env.production]
+name = "lightrail-wisp-server-prod"
+routes = [
+  { pattern = "wisp.example.com/*", zone_name = "example.com" }
+]
