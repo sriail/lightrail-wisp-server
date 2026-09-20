@@ -1,5 +1,8 @@
 name = "lightrail-wisp-server"
 main = "src/worker.py"
+
 compatibility_date = "2026-09-20"
-compatibility_flags = ["python_workers", "disable_python_external_sdk"]
-workers_dev = true
+compatibility_flags = ["python_workers"]
+
+[python_modules]
+exclude = ["**/*.pyc", "**/__pycache__"]
