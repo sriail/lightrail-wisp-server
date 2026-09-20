@@ -11,3 +11,6 @@ name = "lightrail-wisp-server-prod"
 routes = [
   { pattern = "wisp.example.com/*", zone_name = "example.com" }
 ]
+
+[env.staging]
+name = "lightrail-wisp-server-staging"
