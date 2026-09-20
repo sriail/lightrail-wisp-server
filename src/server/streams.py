@@ -1,12 +1,14 @@
-"""Outbound TCP streams and optional HTTP fetch helpers."""
+"""Cloudflare TCP streams used by the Wisp v1 relay."""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
 
-from js import Object, Response, console, eval as js_eval, fetch
-from pyodide.ffi import to_js
+from js import Object, Uint8Array, fetch
+from contextlib import contextmanager
+
+from pyodide.ffi import create_proxy, to_js
 
 from server.rates import (
     CONNECT_TIMEOUT_SECONDS,
@@ -17,23 +19,17 @@ from server.rates import (
 )
 
 
-async def load_tcp_module():
-    """Load Cloudflare's built-in TCP socket module through Python FFI.
+def load_tcp_module():
+    """Return Cloudflare's built-in sockets module."""
+    # `cloudflare:sockets` is one of the runtime modules specially exposed to
+    # Python Workers by the current workers SDK.
+    from workers import import_from_javascript
 
-    Cloudflare exposes connect() from the `cloudflare:sockets` JavaScript module.
-    Python Workers expose JavaScript/runtime APIs through Pyodide's FFI, so this
-    lazy dynamic import keeps the module load inside the request/stream lifecycle.
-    """
-    return await js_eval("import('cloudflare:sockets')")
+    return import_from_javascript("cloudflare:sockets")
 
 
 async def http_get(url: str, headers: dict[str, str] | None = None):
-    """Fetch an HTTP resource with the Workers Fetch API.
-
-    This helper is deliberately not used for Wisp TCP streams: Fetch is HTTP
-    request/response oriented, whereas Wisp DATA requires a long-lived TCP socket.
-    It is provided for ordinary HTTP content acquisition by callers that need it.
-    """
+    """Fetch an ordinary HTTP URL through Workers Fetch."""
     js_headers = to_js(headers or {}, dict_converter=Object.fromEntries)
     return await fetch(
         url,
@@ -48,8 +44,20 @@ async def http_get(url: str, headers: dict[str, str] | None = None):
     )
 
 
+@contextmanager
+def js_uint8array(data: bytes):
+    """Expose Python bytes as a native JS Uint8Array without a large JS list."""
+    proxy = create_proxy(data)
+    buffer = proxy.getBuffer()
+    try:
+        yield buffer.data
+    finally:
+        buffer.release()
+        proxy.destroy()
+
+
 class TCPStream:
-    """One client-visible Wisp stream backed by a Cloudflare TCP socket."""
+    """One Wisp stream backed by a Cloudflare outbound TCP socket."""
 
     def __init__(
         self,
@@ -67,9 +75,9 @@ class TCPStream:
         self.on_closed = on_closed
 
         self.max_buffered_packets = MAX_BUFFERED_PACKETS
-        self.buffer_remaining = MAX_BUFFERED_PACKETS
         self.queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=MAX_BUFFERED_PACKETS)
         self.queued_bytes = 0
+        self.packets_sent = 0
 
         self.socket = None
         self.writer = None
@@ -80,21 +88,31 @@ class TCPStream:
         self._closed = False
         self._close_lock = asyncio.Lock()
 
+    @property
+    def buffer_remaining(self) -> int:
+        return max(0, self.queue.maxsize - self.queue.qsize())
+
     async def open(self, timeout: float = CONNECT_TIMEOUT_SECONDS) -> None:
-        """Create the Cloudflare TCP socket and start bidirectional pumps."""
         if self._closed:
             return
 
         try:
-            sockets = await load_tcp_module()
+            sockets = load_tcp_module()
             address = to_js(
                 {"hostname": self.hostname, "port": self.port},
                 dict_converter=Object.fromEntries,
             )
-            self.socket = sockets.connect(address)
 
-            # `opened` resolves when the destination TCP connection is actually
-            # established, and rejects on connection failure.
+            # Keep the destination connection as plain TCP. Epoxy performs TLS
+            # itself in WebAssembly before the bytes reach this socket.
+            self.socket = sockets.connect(
+                address,
+                to_js(
+                    {"secureTransport": "off", "allowHalfOpen": True},
+                    dict_converter=Object.fromEntries,
+                ),
+            )
+
             await asyncio.wait_for(self.socket.opened, timeout=timeout)
 
             self.writer = self.socket.writable.getWriter()
@@ -107,19 +125,17 @@ class TCPStream:
         except asyncio.TimeoutError:
             await self.close(send_packet=True, reason=0x43)
         except Exception as exc:
-            reason = self._classify_error(exc)
+            from js import console
+
             console.log(
                 f"[wisp] TCP connect failed stream={self.stream_id} "
                 f"{self.hostname}:{self.port}: {exc}"
             )
-            await self.close(send_packet=True, reason=reason)
+            await self.close(send_packet=True, reason=self._classify_error(exc))
 
     def enqueue(self, payload: bytes) -> bool:
-        """Queue one client DATA packet without blocking the WebSocket handler."""
         if self._closed:
             return False
-        if not payload:
-            return True
         if len(payload) > MAX_DATA_PAYLOAD_BYTES:
             return False
         if self.queued_bytes + len(payload) > MAX_QUEUED_BYTES_PER_STREAM:
@@ -128,12 +144,12 @@ class TCPStream:
             self.queue.put_nowait(payload)
         except asyncio.QueueFull:
             return False
-
         self.queued_bytes += len(payload)
-        self.buffer_remaining = max(0, self.buffer_remaining - 1)
         return True
 
     async def _writer_loop(self) -> None:
+        from js import console
+
         try:
             await self._ready.wait()
             while not self._closed:
@@ -141,19 +157,18 @@ class TCPStream:
                 try:
                     if self.writer is None:
                         return
-                    await self.writer.write(to_js(payload))
+                    with js_uint8array(payload) as js_payload:
+                        await self.writer.write(js_payload)
+                    self.packets_sent += 1
+
+                    # Match the reference Wisp v1 servers: refresh the receive
+                    # window periodically instead of sending CONTINUE for every
+                    # packet. The queue itself remains the congestion buffer.
+                    if self.packets_sent % max(1, self.queue.maxsize // 4) == 0:
+                        self.send_continue()
                 finally:
                     self.queued_bytes = max(0, self.queued_bytes - len(payload))
                     self.queue.task_done()
-
-                # A slot has been consumed by the remote TCP writer, so tell the
-                # client it can send another DATA packet. This is also a regular
-                # CONTINUE refresh and avoids unnecessary head-of-line delay.
-                if not self._closed:
-                    self.buffer_remaining = min(
-                        MAX_BUFFERED_PACKETS, self.buffer_remaining + 1
-                    )
-                    self.send_continue()
 
         except asyncio.CancelledError:
             raise
@@ -162,6 +177,8 @@ class TCPStream:
             await self.close(send_packet=True, reason=0x03)
 
     async def _reader_loop(self) -> None:
+        from js import console
+
         try:
             if self.reader is None:
                 return
@@ -174,12 +191,11 @@ class TCPStream:
                 else:
                     result = await self.reader.read()
 
-                done = bool(result.done)
-                value = result.value
-
-                if done:
+                if bool(result.done):
                     await self.close(send_packet=True, reason=0x02)
                     return
+
+                value = result.value
                 if value is None:
                     continue
 
@@ -187,10 +203,8 @@ class TCPStream:
                 if not data:
                     continue
 
-                # Keep each Wisp DATA payload comfortably below the packet ceiling.
                 for start in range(0, len(data), MAX_DATA_PAYLOAD_BYTES):
-                    chunk = data[start : start + MAX_DATA_PAYLOAD_BYTES]
-                    self.send_data(chunk)
+                    self.send_data(data[start : start + MAX_DATA_PAYLOAD_BYTES])
 
         except asyncio.CancelledError:
             raise
@@ -209,14 +223,14 @@ class TCPStream:
 
     @staticmethod
     def _classify_error(exc: BaseException) -> int:
-        message = str(exc).lower()
-        if isinstance(exc, asyncio.TimeoutError) or "timeout" in message:
+        text = str(exc).lower()
+        if isinstance(exc, asyncio.TimeoutError) or "timeout" in text:
             return 0x43
-        if "refused" in message or "econnrefused" in message:
+        if "refused" in text or "econnrefused" in text:
             return 0x44
-        if "resolve" in message or "not found" in message or "dns" in message:
+        if "resolve" in text or "not found" in text or "dns" in text:
             return 0x42
-        if "disallowed" in message or "private" in message:
+        if "disallowed" in text or "private" in text:
             return 0x48
         return 0x03
 
@@ -228,11 +242,15 @@ class TCPStream:
     def send_continue(self) -> None:
         from server.connection import CONTINUE, build_packet
 
-        payload = int(self.buffer_remaining).to_bytes(4, "little")
-        self.send_packet(build_packet(CONTINUE, self.stream_id, payload))
+        self.send_packet(
+            build_packet(
+                CONTINUE,
+                self.stream_id,
+                int(self.buffer_remaining).to_bytes(4, "little"),
+            )
+        )
 
     async def close(self, *, send_packet: bool, reason: int = 0x02) -> None:
-        """Close the TCP socket and optionally emit Wisp CLOSE."""
         async with self._close_lock:
             if self._closed:
                 return

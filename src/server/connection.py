@@ -6,7 +6,9 @@ import asyncio
 import ipaddress
 
 from js import console
-from pyodide.ffi import create_proxy, to_js
+from contextlib import contextmanager
+
+from pyodide.ffi import create_proxy
 
 from server.net import StreamTable
 from server.rates import (
@@ -292,10 +294,9 @@ class WispConnection:
 
         console.log(f"[wisp] TCP connect stream={stream_id} {hostname}:{port}")
 
-        # Permit the client to queue DATA immediately after CONNECT, as allowed
-        # by Wisp, without forcing it to wait for TCP connection establishment.
-        self.send_continue(stream_id, stream.buffer_remaining)
-
+        # Wisp v1 permits the client to begin sending DATA immediately after
+        # CONNECT. The initial stream window comes from the connection-level
+        # CONTINUE on stream 0; later CONTINUE packets are refreshes.
         task = asyncio.create_task(stream.open(CONNECT_TIMEOUT_SECONDS))
         self._track_task(task)
 
@@ -337,11 +338,25 @@ class WispConnection:
     def _stream_closed(self, stream_id: int) -> None:
         self.streams.remove(stream_id)
 
+    @staticmethod
+    @contextmanager
+    def _js_buffer(data: bytes):
+        # Use Pyodide's native buffer bridge rather than copying through a JS
+        # Array. This produces a Uint8Array-compatible view for WebSocket.send.
+        proxy = create_proxy(data)
+        buffer = proxy.getBuffer()
+        try:
+            yield buffer.data
+        finally:
+            buffer.release()
+            proxy.destroy()
+
     def send_packet(self, packet: bytes) -> None:
         if self._closed:
             return
         try:
-            self.websocket.send(to_js(packet))
+            with self._js_buffer(packet) as js_packet:
+                self.websocket.send(js_packet)
         except Exception as exc:
             console.log(f"[wisp] websocket send failed: {exc}")
 
