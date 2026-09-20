@@ -3,6 +3,7 @@ import logging
 import json
 import os
 import sys
+from . import version
 
 # Configure logging for Cloudflare
 class CloudflareHandler(logging.Handler):
@@ -109,8 +110,6 @@ async def handle_request(request: dict, env: dict) -> dict:
     
     # Regular HTTP - serve landing page
     try:
-        import wisp
-        version = getattr(wisp, 'version', '0.0.0')
         
         html = f"""
 <!DOCTYPE html>
