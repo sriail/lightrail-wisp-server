@@ -22,7 +22,7 @@ logger.setLevel(logging.INFO)
 
 # Import wisp server modules
 try:
-    from wisp.server import http, net, ratelimit
+    from .server import http, net, ratelimit
 except ImportError as e:
     logger.error(f"Failed to import wisp modules: {e}")
     sys.exit(1)
