@@ -36,7 +36,10 @@ class WSProxyConnection:
       logging.info(f"Creating a WSProxy stream to {self.tcp_host}:{self.tcp_port} failed: {e}")
       await self.ws.close()
 
+  # CHANGED: Modified to buffer and poll instead of streaming directly
   async def handle_ws(self):
+    send_buffer = bytearray()
+    
     while True:
       try:
         data = await self.ws.recv()
@@ -44,18 +47,49 @@ class WSProxyConnection:
         break
 
       await ratelimit.limit_client_bandwidth(self.client_ip, len(data), "ws")
-      await self.conn.send(data)
+      # NEW: Buffer the data instead of sending immediately
+      send_buffer.extend(data)
+      
+      # NEW: Send buffered data when buffer reaches threshold or on next iteration
+      if len(send_buffer) > 4096 or len(data) < 1024:
+        try:
+          await self.conn.send(bytes(send_buffer))
+          send_buffer.clear()
+        except Exception as e:
+          logging.warn(f"Failed to send data: {e}")
+          break
+    
+    # NEW: Flush remaining buffer
+    if send_buffer:
+      try:
+        await self.conn.send(bytes(send_buffer))
+      except:
+        pass
     
     self.conn.close()
   
+  # CHANGED: Modified to poll for data instead of continuous streaming
   async def handle_tcp(self):
     while True:
-      data = await self.conn.recv()
+      try:
+        # NEW: Poll with timeout instead of blocking read
+        data = await asyncio.wait_for(self.conn.recv(), timeout=1.0)
+      except asyncio.TimeoutError:
+        # NEW: No data available, continue polling
+        continue
+      except Exception as e:
+        logging.warn(f"Failed to receive data: {e}")
+        break
+      
       if len(data) == 0:
         break #socket closed
 
       await ratelimit.limit_client_bandwidth(self.client_ip, len(data), "tcp")
-      await self.ws.send(data)
+      try:
+        await self.ws.send(data)
+      except Exception as e:
+        logging.warn(f"Failed to send to websocket: {e}")
+        break
     
     await self.ws.close()
 
@@ -103,6 +137,7 @@ class WispConnection:
       return
     
     self.active_streams[stream_id]["type"] = stream_type
+    # CHANGED: Use polling tasks instead of continuous streaming
     ws_to_tcp_task = asyncio.create_task(self.task_wrapper(self.stream_ws_to_tcp, stream_id))
     tcp_to_ws_task = asyncio.create_task(self.task_wrapper(self.stream_tcp_to_ws, stream_id))
     self.active_streams[stream_id]["ws_to_tcp_task"] = ws_to_tcp_task
@@ -115,30 +150,58 @@ class WispConnection:
       await target_func(*args, **kwargs)
     except asyncio.CancelledError as e:
       raise e
-        
-  async def stream_ws_to_tcp(self, stream_id):
-    #this infinite loop should get killed by the task.cancel call later on
-    stream = self.active_streams[stream_id]
-    while True: 
-      data = await stream["queue"].get()
-      try:
-        await stream["conn"].send(data)
-      except:
-        break
-
-      #send a CONTINUE packet periodically
-      stream["packets_sent"] += 1
-      if stream["packets_sent"] % (queue_size // 4) == 0:
-        buffer_remaining = stream["queue"].maxsize - stream["queue"].qsize()
-        continue_payload = struct.pack(continue_format, buffer_remaining)
-        continue_packet = struct.pack(packet_format, 0x03, stream_id) + continue_payload
-        await self.ws.send(continue_packet)
   
-  async def stream_tcp_to_ws(self, stream_id):
+  # CHANGED: Buffer-based send instead of continuous queue drain
+  async def stream_ws_to_tcp(self, stream_id):
     stream = self.active_streams[stream_id]
+    send_buffer = bytearray()
+    
     while True:
       try:
-        data = await stream["conn"].recv()
+        # NEW: Get data from queue with timeout for periodic flushing
+        data = await asyncio.wait_for(stream["queue"].get(), timeout=0.1)
+        send_buffer.extend(data)
+      except asyncio.TimeoutError:
+        # NEW: Flush buffer on timeout even if not full
+        pass
+      except:
+        break
+      
+      # NEW: Send buffered data when buffer reaches threshold
+      if len(send_buffer) > 8192:
+        try:
+          await stream["conn"].send(bytes(send_buffer))
+          send_buffer.clear()
+          
+          # CHANGED: Send CONTINUE packet less frequently
+          stream["packets_sent"] += 1
+          if stream["packets_sent"] % (queue_size // 4) == 0:
+            buffer_remaining = stream["queue"].maxsize - stream["queue"].qsize()
+            continue_payload = struct.pack(continue_format, buffer_remaining)
+            continue_packet = struct.pack(packet_format, 0x03, stream_id) + continue_payload
+            await self.ws.send(continue_packet)
+        except:
+          break
+      
+      # NEW: Periodic flush
+      if len(send_buffer) > 0:
+        try:
+          await stream["conn"].send(bytes(send_buffer))
+          send_buffer.clear()
+        except:
+          break
+  
+  # CHANGED: Poll-based receive instead of continuous blocking read
+  async def stream_tcp_to_ws(self, stream_id):
+    stream = self.active_streams[stream_id]
+    
+    while True:
+      try:
+        # NEW: Poll with timeout to avoid blocking forever
+        data = await asyncio.wait_for(stream["conn"].recv(), timeout=1.0)
+      except asyncio.TimeoutError:
+        # NEW: No data, try again
+        continue
       except Exception as e:
         logging.warn(f"({self.id}) Receiving data from stream failed: {e}")
         await self.send_close_packet(stream_id, 0x03)
@@ -147,10 +210,15 @@ class WispConnection:
         
       if len(data) == 0: #connection closed
         break
+      
       data_packet = struct.pack(packet_format, 0x02, stream_id) + data
 
       await ratelimit.limit_client_bandwidth(self.client_ip, len(data_packet), "tcp")
-      await self.ws.send(data_packet)
+      try:
+        await self.ws.send(data_packet)
+      except Exception as e:
+        logging.warn(f"({self.id}) Failed to send to websocket: {e}")
+        break
 
     await self.send_close_packet(stream_id, 0x02)
     self.close_stream(stream_id)
