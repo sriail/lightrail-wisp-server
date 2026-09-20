@@ -1,7 +1,0 @@
-from wisp.server.connection import WispConnection
-from wisp.server.connection import WSProxyConnection
-
-__all__ = [
-    "WispConnection",
-    "WSProxyConnection",
-]

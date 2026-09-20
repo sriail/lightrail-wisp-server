@@ -1,14 +1,14 @@
 name = "lightrail-wisp-server"
-main = "wisp/worker.py"
-compatibility_date = "2024-12-16"
-compatibility_flags = ["python_workers"]
+main = "src/entry.py"
+ 
+compatibility_date = "2026-09-20"
 
-vars = { LOG_LEVEL = "info", RATE_LIMIT_ENABLED = "true", RATE_LIMIT_BANDWIDTH = "1000", RATE_LIMIT_CONNECTIONS = "30", RATE_LIMIT_WINDOW = "60", ALLOW_LOOPBACK = "false", ALLOW_PRIVATE = "false", BLOCK_UDP = "false", BLOCK_TCP = "false" }
+[observability]
+enabled = false
 
-[env.production]
-name = "lightrail-wisp-prod"
-vars = { LOG_LEVEL = "info", RATE_LIMIT_ENABLED = "true", RATE_LIMIT_BANDWIDTH = "5000", RATE_LIMIT_CONNECTIONS = "100", RATE_LIMIT_WINDOW = "60" }
+[assets]
+directory = "./src"
+binding = "ASSETS"
+html_handling = "force-trailing-slash"
+not_found_handling = "404-page"
 
-[[env.production.routes]]
-pattern = "wisp.example.com/*"
-zone_name = "example.com"
