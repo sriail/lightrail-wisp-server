@@ -1,5 +1,5 @@
 name = "lightrail-wisp-server"
-main = "wisp/worker.py"
+main = "worker.py"
 compatibility_date = "2024-12-16"
 compatibility_flags = ["python_workers"]
 
