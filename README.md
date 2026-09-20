@@ -1,39 +1,55 @@
-<div align="center">
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="256" height="256">
-<path d="M242.97 31.07C274.81 29.39 306.94 34.13 336.48 45.76C417.78 77.76 473.4 151.29 480.21 238.7C482.17 263.79 480.6 289.37 473.84 313.65C466.92 338.51 456.43 362.19 441.68 383.49C419.34 415.76 389.42 440.43 354.76 458.32C328.48 471.88 298.5 479.17 268.98 480.92C237.5 482.78 204.56 478.26 175.45 466.32C162.99 461.22 150.74 455.82 139.17 448.83C105.52 428.51 75.1 397.66 57.23 362.46C44.33 337.05 35.79 310.55 32.18 282.18C19.98 186.44 74.5 91.92 161.33 51.66C186.87 39.82 214.7 32.57 242.97 31.07ZM266.08 92.92C269.74 91.75 290.31 91.77 294.24 92.72C298.56 93.77 302.25 97.95 306.97 97.7C313.94 97.32 318.59 89.63 315.78 83.3C313.76 78.74 302.78 73.61 298.08 72.41C295.45 71.74 292.35 72.17 289.67 72.17C265.22 72.17 240.69 71.57 216.26 72.17C209.71 72.33 196.55 79.36 195.4 86.27C194.47 91.91 199.74 97.9 205.5 97.72C210.06 97.58 213.53 93.74 217.76 92.72C221.58 91.8 242.43 91.76 245.91 92.95C245.91 99.47 245.91 105.99 245.91 112.51C241.52 113.36 236.64 112.83 232.15 112.83C222.65 112.83 213.14 112.83 203.63 112.83C198.56 112.83 193.23 112.37 188.2 113.08C179.9 114.26 172.54 119.13 165.15 122.8C159.4 125.66 149.57 128.41 146.24 134.32C143.44 139.29 144.77 146.67 144.77 152.2C144.77 165.6 144.77 179.01 144.77 192.41C144.77 234.18 144.77 275.95 144.77 317.72C144.77 336.92 140.43 362.69 161.47 372.76C165.78 374.82 170.19 375.21 174.78 376.17C176.66 387 171.04 397.83 167.82 407.94C167.02 410.43 165.33 413.38 165.29 415.98C167.32 417.03 170.44 416.49 172.77 416.49C175.92 416.49 181.81 417.65 184.65 416.33C186.25 415.58 186.67 411.87 187.14 410.35C188.49 405.99 189.69 399.83 192.41 396.16C234.8 396.16 277.2 396.16 319.59 396.16C322.29 399.88 323.48 405.99 324.84 410.37C325.32 411.89 325.73 415.59 327.35 416.33C330.11 417.59 335.71 416.49 338.76 416.49C341.19 416.49 344.64 417.11 346.71 415.91C346.61 413.48 345.09 410.63 344.29 408.32C340.83 398.32 335.35 386.91 337.22 376.17C342.39 375.06 347.26 374.51 351.99 371.88C371.61 360.95 367.2 336.12 367.22 317.25C367.26 275.79 367.21 234.34 367.21 192.88C367.21 179.01 367.21 165.13 367.21 151.26C367.21 145.59 368.6 138.07 364.95 133.25C361.34 128.5 353.89 126.36 348.72 123.75C340.81 119.77 332.7 114.37 323.8 113.09C318.77 112.36 313.43 112.83 308.37 112.83C298.86 112.83 289.35 112.83 279.85 112.83C275.35 112.83 270.5 113.33 266.08 112.53C266.08 105.99 266.08 99.46 266.08 92.92ZM215.41 133.01C239 132.17 262.78 133 286.39 133C293.94 133 307.57 132.08 306.57 143.72C305.64 154.67 294.44 153.17 286.39 153.17C269.25 153.17 252.1 153.17 234.96 153.17C229.58 153.17 216.63 154.43 212.14 152.79C201.77 149.01 204.49 133.41 215.41 133.01ZM174.28 173.65C178.95 173.02 183.96 173.5 188.67 173.5C198.02 173.5 207.37 173.5 216.72 173.5C245.25 173.5 273.77 173.5 302.29 173.5C311.95 173.5 321.62 173.5 331.28 173.5C336.11 173.5 341.44 173.07 344.75 177.29C348.46 182.03 347.04 189.57 347.04 195.21C347.04 209.4 347.04 223.58 347.04 237.76C347.04 247.12 347.04 256.47 347.04 265.82C347.04 270.25 347.91 275.61 345.8 279.67C343.24 284.59 337.99 284.84 333.15 284.84C324.42 284.84 315.69 284.84 306.97 284.84C271.74 284.84 236.52 284.84 201.29 284.84C193.01 284.84 170.82 287.84 166.34 279.97C163.3 274.63 164.96 261.87 164.96 255.53C164.96 235.74 164.96 215.94 164.96 196.15C164.96 187.5 162.82 175.21 174.28 173.65ZM178.48 305.08C199.3 303.78 200.87 334.43 180.72 335.4C161.19 336.34 159.81 306.24 178.48 305.08ZM330 305.08C349.14 303.59 353.47 331.1 335.72 335.02C314.04 339.81 309.99 306.64 330 305.08Z" fill="#000000" fill-rule="evenodd" stroke="#000000" stroke-width="0.25" stroke-linejoin="round"/>
-</svg>
+# Wisp Python Worker
 
-  <h1>Lightrail</h1>
-  <p>a Light Wisp Server (Just pure Python and Cloudflare Workers) based on Wisp Python</p>
+Small Wisp v1 TCP-over-WebSocket proxy for Cloudflare Python Workers.
 
-  <h2>Deploy</h2>
-  <p>Use the Button Below to Deploy To Cloudflare</p>
-  <br />
+## Layout
 
-  [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/sriail/lightrail-wisp-server)
-  <br />
+```text
+wrangler.toml
+pyproject.toml
+src/
+├── worker.py
+├── page.py
+└── server/
+    ├── server.py
+    ├── connection.py
+    ├── rates.py
+    ├── udp.py
+    ├── net.py
+    └── streams.py
+```
 
-  <h2>Stability and Notes On TCP</h2>
-  <p>From what I know, the proxy is very stable. However, Cloudflare can limit the number of request (occasionally sub-request) to 50 for Non-Premium Accounts, and does not support TCP (Meaning only UDP request get fully proxied) which will potentially be fixed in a update to Cloudflare workers.</p>
-  <br />
+## Behavior
 
-  <h2>Quick Roadmap</h2>
-</div>
+- WebSocket endpoint must use a trailing `/`, as required by the Wisp URL guidance.
+- The server sends the initial `CONTINUE` immediately after the WebSocket is accepted, on stream ID `0`.
+- Wisp packets use the 1-byte type + 4-byte little-endian stream ID + payload layout.
+- TCP CONNECT creates a Cloudflare outbound TCP socket with `cloudflare:sockets`.
+- DATA is queued per TCP stream with a fixed packet-count buffer.
+- CONTINUE is refreshed as queued DATA is written to the TCP socket.
+- CLOSE immediately tears down the associated stream.
+- UDP (`stream type 0x02`) is silently ignored and only logged server-side; no Wisp response tells the client that UDP is disabled.
+- Literal loopback/private/reserved IP destinations and obvious local-only hostnames are blocked.
 
-<div align="center">
-<div align="left" style="display: inline-block;">
+## Local development
 
-- [x] Add TCP support (grab tcp in some other way and send it out as alt udp streams to the client, or just wait for them to add it natively???)
-- [x] Add Domain Mirroring ( Can access on alt Cloudflare domains for the worker, may already work?)
-- [x] Add Rate Limiting
-- [ ] Add Plugins for JSON, CSV input and output, Web Crawling, and LLM saerch
+Current Cloudflare Python Worker tooling uses PyWrangler. A typical setup is:
 
-<div align="center">
-  <h2>Notes</h2>
-  <p>Because of Cloudflare places a 100,000 request restricton on the connect() Api, the endpoint will not be able to handle tons of trafic daily without the premum subscription
-  (Which hase a limit of 10,000,000 daily request) so it is recomended to host on your owen hardware if possable for maximum preformance.</p>
-  <br />
+```bash
+uv sync
+uv run pywrangler dev
+```
 
-</div>
-</div>
-</div>
+Then open the development URL in a browser to see the placeholder page, or connect a Wisp client to the WebSocket URL ending in `/`.
+
+## Deploy
+
+```bash
+uv run pywrangler deploy
+```
+
+This project intentionally does not add a JavaScript worker shim. The Python Worker uses Pyodide FFI to access `WebSocketPair` and lazily imports Cloudflare's `cloudflare:sockets` runtime module for outbound TCP.
+
+## Important Cloudflare note
+
+`fetch()` is used for ordinary HTTP content acquisition, but it cannot substitute for a full-duplex arbitrary TCP socket. Wisp DATA streams therefore use the Workers TCP socket runtime API. This is what preserves actual Wisp TCP proxy semantics.
