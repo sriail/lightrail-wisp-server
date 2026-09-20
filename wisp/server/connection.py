@@ -3,7 +3,7 @@ import struct
 import os
 import logging
 
-from websockets.exceptions import ConnectionClosed
+class ConnectionClosed(Exception):
 
 from wisp.server import ratelimit
 from wisp.server import net
