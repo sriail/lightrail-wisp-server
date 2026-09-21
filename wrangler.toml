@@ -6,3 +6,7 @@ compatibility_flags = ["python_workers"]
 
 [python_modules]
 exclude = ["**/*.pyc", "**/__pycache__"]
+
+[observability.logs]
+enabled = false
+invocation_logs = true
