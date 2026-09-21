@@ -1,5 +1,8 @@
 """
-Diagnostic version to debug cloudflare:sockets access in Python Workers.
+Fixed TCP stream handler with proper TLS configuration.
+
+The issue: Using secureTransport="off" on port 443 confuses Cloudflare.
+The solution: Automatically detect HTTPS ports and use secureTransport="on".
 """
 
 from __future__ import annotations
@@ -7,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 
-from js import Object, fetch, console
+from js import Object, console
 from contextlib import contextmanager
 
 from pyodide.ffi import create_proxy, to_js
@@ -22,37 +25,14 @@ from server.rates import (
 
 
 def load_tcp_module():
-    """Return Cloudflare's built-in sockets module — diagnostic version."""
-    try:
-        from workers import import_from_javascript
-        
-        console.log("[TCP-DIAGNOSTIC] Attempting to import cloudflare:sockets")
-        
-        # Try the standard import
-        module = import_from_javascript("cloudflare:sockets")
-        console.log(f"[TCP-DIAGNOSTIC] Successfully imported cloudflare:sockets")
-        console.log(f"[TCP-DIAGNOSTIC] Module type: {type(module)}")
-        console.log(f"[TCP-DIAGNOSTIC] Module keys: {dir(module)}")
-        
-        # Check if connect exists
-        if hasattr(module, 'connect'):
-            console.log("[TCP-DIAGNOSTIC] connect() function found on module")
-        else:
-            console.log("[TCP-DIAGNOSTIC] WARNING: connect() function NOT found on module")
-            console.log(f"[TCP-DIAGNOSTIC] Available attributes: {[x for x in dir(module) if not x.startswith('_')]}")
-        
-        return module
-    except ImportError as e:
-        console.log(f"[TCP-DIAGNOSTIC] ImportError: {e}")
-        raise
-    except Exception as e:
-        console.log(f"[TCP-DIAGNOSTIC] Unexpected error loading module: {e}")
-        console.log(f"[TCP-DIAGNOSTIC] Error type: {type(e)}")
-        raise
+    """Return Cloudflare's built-in sockets module."""
+    from workers import import_from_javascript
+    return import_from_javascript("cloudflare:sockets")
 
 
 async def http_get(url: str, headers: dict[str, str] | None = None):
     """Fetch an ordinary HTTP URL through Workers Fetch."""
+    from js import fetch
     js_headers = to_js(headers or {}, dict_converter=Object.fromEntries)
     return await fetch(
         url,
@@ -81,6 +61,9 @@ def js_uint8array(data: bytes):
 
 class TCPStream:
     """One Wisp stream backed by a Cloudflare outbound TCP socket."""
+
+    # HTTPS ports that should use TLS
+    HTTPS_PORTS = {443, 8443, 9443}
 
     def __init__(
         self,
@@ -115,49 +98,66 @@ class TCPStream:
     def buffer_remaining(self) -> int:
         return max(0, self.queue.maxsize - self.queue.qsize())
 
+    def _should_use_tls(self) -> bool:
+        """
+        Determine if TLS should be used based on port.
+        
+        Port 443 and other HTTPS ports should use TLS.
+        The WISP protocol itself handles TLS at the application layer,
+        but for the TCP socket to Cloudflare, we need to match the target's
+        protocol expectations.
+        """
+        return self.port in self.HTTPS_PORTS
+
     async def open(self, timeout: float = CONNECT_TIMEOUT_SECONDS) -> None:
         if self._closed:
             return
 
         try:
-            # Load and inspect the TCP module
-            console.log(f"[wisp-tcp] Loading TCP module for {self.hostname}:{self.port}")
             sockets = load_tcp_module()
+
+            # Determine if we should use TLS based on port
+            use_tls = self._should_use_tls()
+            secure_transport = "on" if use_tls else "off"
 
             console.log(
                 f"[wisp-tcp] Attempting connection to {self.hostname}:{self.port} "
-                f"(stream_id={self.stream_id}, timeout={timeout}s)"
+                f"(stream_id={self.stream_id}, timeout={timeout}s, tls={use_tls})"
             )
 
-            # Prepare address
             address = to_js(
                 {"hostname": self.hostname, "port": self.port},
                 dict_converter=Object.fromEntries,
             )
-            
-            console.log(f"[wisp-tcp] Address object prepared: hostname={self.hostname}, port={self.port}")
 
-            # Prepare options
+            # FIX: Use proper TLS setting based on port
+            # - Port 443, 8443, 9443: use TLS (secureTransport="on")
+            # - Other ports: no TLS (secureTransport="off")
+            # 
+            # IMPORTANT: WISP expects the proxy to NOT do TLS (it does TLS in WASM).
+            # However, when connecting to HTTPS ports through Cloudflare's TCP socket API,
+            # we must tell Cloudflare to establish a TLS connection to the target.
+            # The encrypted data from the client (via Epoxy) will flow through this TLS tunnel.
             options = to_js(
-                {"secureTransport": "off", "allowHalfOpen": True},
+                {
+                    "secureTransport": secure_transport,
+                    "allowHalfOpen": True,
+                },
                 dict_converter=Object.fromEntries,
             )
-            
-            console.log("[wisp-tcp] Options prepared with secureTransport=off, allowHalfOpen=True")
 
-            # Call connect
-            console.log("[wisp-tcp] Calling sockets.connect()...")
+            console.log(
+                f"[wisp-tcp] Socket options: secureTransport={secure_transport}, "
+                f"allowHalfOpen=True"
+            )
+
             self.socket = sockets.connect(address, options)
-            
-            console.log(f"[wisp-tcp] Socket object created: {type(self.socket)}")
 
-            # Wait for connection to open
-            console.log("[wisp-tcp] Waiting for socket.opened promise...")
             await asyncio.wait_for(self.socket.opened, timeout=timeout)
 
             console.log(
                 f"[wisp-tcp] Successfully established TCP connection to {self.hostname}:{self.port} "
-                f"(stream_id={self.stream_id})"
+                f"(stream_id={self.stream_id}, tls={use_tls})"
             )
 
             self.writer = self.socket.writable.getWriter()
@@ -175,8 +175,6 @@ class TCPStream:
                 f"[wisp-tcp] TCP connect failed stream={self.stream_id} "
                 f"{self.hostname}:{self.port}: {exc}"
             )
-            console.log(f"[wisp-tcp] Exception type: {type(exc)}")
-            console.log(f"[wisp-tcp] Exception details: {str(exc)}")
             await self.close(send_packet=True, reason=self._classify_error(exc))
 
     def enqueue(self, payload: bytes) -> bool:
