@@ -3,10 +3,17 @@ main = "src/worker.py"
 
 compatibility_date = "2026-04-20"
 compatibility_flags = ["python_workers"]
-
 [python_modules]
 exclude = ["**/*.pyc", "**/__pycache__"]
 
+## Enables Logs and Traces (optional, you can disable)
 [observability.logs]
-enabled = false
+enabled = true
+head_sampling_rate = 1
 invocation_logs = true
+persist = true
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 1
+persist = true
