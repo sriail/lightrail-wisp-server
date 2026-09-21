@@ -1,10 +1,5 @@
 """
-Fixed TCP streams using Cloudflare Workers connect() API.
-
-Key changes:
-- Import connect from 'cloudflare:sockets' instead of using workers module
-- Properly handle socket connection with better error diagnostics
-- Add logging to identify which addresses are being blocked
+Diagnostic version to debug cloudflare:sockets access in Python Workers.
 """
 
 from __future__ import annotations
@@ -12,7 +7,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 
-from js import console
+from js import Object, fetch, console
 from contextlib import contextmanager
 
 from pyodide.ffi import create_proxy, to_js
@@ -26,10 +21,50 @@ from server.rates import (
 )
 
 
-def load_socket_module():
-    """Import the cloudflare:sockets module for outbound TCP."""
-    from workers import import_from_javascript
-    return import_from_javascript("cloudflare:sockets")
+def load_tcp_module():
+    """Return Cloudflare's built-in sockets module — diagnostic version."""
+    try:
+        from workers import import_from_javascript
+        
+        console.log("[TCP-DIAGNOSTIC] Attempting to import cloudflare:sockets")
+        
+        # Try the standard import
+        module = import_from_javascript("cloudflare:sockets")
+        console.log(f"[TCP-DIAGNOSTIC] Successfully imported cloudflare:sockets")
+        console.log(f"[TCP-DIAGNOSTIC] Module type: {type(module)}")
+        console.log(f"[TCP-DIAGNOSTIC] Module keys: {dir(module)}")
+        
+        # Check if connect exists
+        if hasattr(module, 'connect'):
+            console.log("[TCP-DIAGNOSTIC] connect() function found on module")
+        else:
+            console.log("[TCP-DIAGNOSTIC] WARNING: connect() function NOT found on module")
+            console.log(f"[TCP-DIAGNOSTIC] Available attributes: {[x for x in dir(module) if not x.startswith('_')]}")
+        
+        return module
+    except ImportError as e:
+        console.log(f"[TCP-DIAGNOSTIC] ImportError: {e}")
+        raise
+    except Exception as e:
+        console.log(f"[TCP-DIAGNOSTIC] Unexpected error loading module: {e}")
+        console.log(f"[TCP-DIAGNOSTIC] Error type: {type(e)}")
+        raise
+
+
+async def http_get(url: str, headers: dict[str, str] | None = None):
+    """Fetch an ordinary HTTP URL through Workers Fetch."""
+    js_headers = to_js(headers or {}, dict_converter=Object.fromEntries)
+    return await fetch(
+        url,
+        to_js(
+            {
+                "method": "GET",
+                "headers": js_headers,
+                "redirect": "follow",
+            },
+            dict_converter=Object.fromEntries,
+        ),
+    )
 
 
 @contextmanager
@@ -85,30 +120,43 @@ class TCPStream:
             return
 
         try:
-            sockets = load_socket_module()
-            
+            # Load and inspect the TCP module
+            console.log(f"[wisp-tcp] Loading TCP module for {self.hostname}:{self.port}")
+            sockets = load_tcp_module()
+
             console.log(
                 f"[wisp-tcp] Attempting connection to {self.hostname}:{self.port} "
                 f"(stream_id={self.stream_id}, timeout={timeout}s)"
             )
 
-            # Use connect() from cloudflare:sockets
-            # Note: secureTransport defaults to "off", which is correct for WISP
-            # (Epoxy handles TLS in WASM)
+            # Prepare address
             address = to_js(
                 {"hostname": self.hostname, "port": self.port},
-                dict_converter=lambda x: x,
+                dict_converter=Object.fromEntries,
             )
             
-            # Call connect() - this returns a socket immediately
-            # But the connection is not established until we await socket.opened
-            self.socket = sockets.connect(address)
+            console.log(f"[wisp-tcp] Address object prepared: hostname={self.hostname}, port={self.port}")
+
+            # Prepare options
+            options = to_js(
+                {"secureTransport": "off", "allowHalfOpen": True},
+                dict_converter=Object.fromEntries,
+            )
             
-            # Wait for the connection to actually establish
+            console.log("[wisp-tcp] Options prepared with secureTransport=off, allowHalfOpen=True")
+
+            # Call connect
+            console.log("[wisp-tcp] Calling sockets.connect()...")
+            self.socket = sockets.connect(address, options)
+            
+            console.log(f"[wisp-tcp] Socket object created: {type(self.socket)}")
+
+            # Wait for connection to open
+            console.log("[wisp-tcp] Waiting for socket.opened promise...")
             await asyncio.wait_for(self.socket.opened, timeout=timeout)
 
             console.log(
-                f"[wisp-tcp] Successfully connected to {self.hostname}:{self.port} "
+                f"[wisp-tcp] Successfully established TCP connection to {self.hostname}:{self.port} "
                 f"(stream_id={self.stream_id})"
             )
 
@@ -120,16 +168,15 @@ class TCPStream:
             self.reader_task = asyncio.create_task(self._reader_loop())
 
         except asyncio.TimeoutError:
-            console.log(
-                f"[wisp-tcp] Connection timeout for {self.hostname}:{self.port} "
-                f"(stream_id={self.stream_id})"
-            )
+            console.log(f"[wisp-tcp] Connection timeout for {self.hostname}:{self.port}")
             await self.close(send_packet=True, reason=0x43)
         except Exception as exc:
             console.log(
                 f"[wisp-tcp] TCP connect failed stream={self.stream_id} "
                 f"{self.hostname}:{self.port}: {exc}"
             )
+            console.log(f"[wisp-tcp] Exception type: {type(exc)}")
+            console.log(f"[wisp-tcp] Exception details: {str(exc)}")
             await self.close(send_packet=True, reason=self._classify_error(exc))
 
     def enqueue(self, payload: bytes) -> bool:
@@ -158,7 +205,6 @@ class TCPStream:
                         await self.writer.write(js_payload)
                     self.packets_sent += 1
 
-                    # Refresh receive window periodically
                     if self.packets_sent % max(1, self.queue.maxsize // 4) == 0:
                         self.send_continue()
                 finally:
@@ -168,7 +214,7 @@ class TCPStream:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            console.log(f"[wisp-tcp] TCP write failed stream={self.stream_id}: {exc}")
+            console.log(f"[wisp] TCP write failed stream={self.stream_id}: {exc}")
             await self.close(send_packet=True, reason=0x03)
 
     async def _reader_loop(self) -> None:
@@ -204,7 +250,7 @@ class TCPStream:
         except asyncio.TimeoutError:
             await self.close(send_packet=True, reason=0x47)
         except Exception as exc:
-            console.log(f"[wisp-tcp] TCP read failed stream={self.stream_id}: {exc}")
+            console.log(f"[wisp] TCP read failed stream={self.stream_id}: {exc}")
             await self.close(send_packet=True, reason=0x03)
 
     @staticmethod
@@ -216,28 +262,16 @@ class TCPStream:
 
     @staticmethod
     def _classify_error(exc: BaseException) -> int:
-        """Map exceptions to WISP close reason codes."""
         text = str(exc).lower()
-        
-        # Connection disallowed (private IP, loopback, Cloudflare IPs, etc.)
-        if "disallowed" in text or "private" in text or "cannot connect" in text:
-            console.log(f"[wisp-tcp] Connection disallowed: {text}")
-            return 0x48  # CLOSE_BLOCKED
-        
-        # Timeout
         if isinstance(exc, asyncio.TimeoutError) or "timeout" in text:
-            return 0x43  # CLOSE_TIMEOUT
-        
-        # Refused/connection error
+            return 0x43
         if "refused" in text or "econnrefused" in text:
-            return 0x44  # CLOSE_REFUSED
-        
-        # DNS/resolution error
+            return 0x44
         if "resolve" in text or "not found" in text or "dns" in text:
-            return 0x42  # CLOSE_UNREACHABLE
-        
-        # Generic network error
-        return 0x03  # CLOSE_NETWORK_ERROR
+            return 0x42
+        if "disallowed" in text or "private" in text or "proxy request failed" in text:
+            return 0x48
+        return 0x03
 
     def send_data(self, payload: bytes) -> None:
         from server.connection import DATA, build_packet
