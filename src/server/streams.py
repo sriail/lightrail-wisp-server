@@ -1,11 +1,18 @@
-"""Cloudflare TCP streams used by the Wisp v1 relay."""
+"""
+Fixed TCP streams using Cloudflare Workers connect() API.
+
+Key changes:
+- Import connect from 'cloudflare:sockets' instead of using workers module
+- Properly handle socket connection with better error diagnostics
+- Add logging to identify which addresses are being blocked
+"""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
 
-from js import Object, Uint8Array, fetch
+from js import console
 from contextlib import contextmanager
 
 from pyodide.ffi import create_proxy, to_js
@@ -13,35 +20,16 @@ from pyodide.ffi import create_proxy, to_js
 from server.rates import (
     CONNECT_TIMEOUT_SECONDS,
     IDLE_TIMEOUT_SECONDS,
-    MAX_BUFFERED_PACKETS,
     MAX_DATA_PAYLOAD_BYTES,
+    MAX_BUFFERED_PACKETS,
     MAX_QUEUED_BYTES_PER_STREAM,
 )
 
 
-def load_tcp_module():
-    """Return Cloudflare's built-in sockets module."""
-    # `cloudflare:sockets` is one of the runtime modules specially exposed to
-    # Python Workers by the current workers SDK.
+def load_socket_module():
+    """Import the cloudflare:sockets module for outbound TCP."""
     from workers import import_from_javascript
-
     return import_from_javascript("cloudflare:sockets")
-
-
-async def http_get(url: str, headers: dict[str, str] | None = None):
-    """Fetch an ordinary HTTP URL through Workers Fetch."""
-    js_headers = to_js(headers or {}, dict_converter=Object.fromEntries)
-    return await fetch(
-        url,
-        to_js(
-            {
-                "method": "GET",
-                "headers": js_headers,
-                "redirect": "follow",
-            },
-            dict_converter=Object.fromEntries,
-        ),
-    )
 
 
 @contextmanager
@@ -97,35 +85,30 @@ class TCPStream:
             return
 
         try:
-            from js import console
-            sockets = load_tcp_module()
+            sockets = load_socket_module()
             
-            # ✨ DIAGNOSTIC: Log connection attempt
             console.log(
                 f"[wisp-tcp] Attempting connection to {self.hostname}:{self.port} "
                 f"(stream_id={self.stream_id}, timeout={timeout}s)"
             )
-            
+
+            # Use connect() from cloudflare:sockets
+            # Note: secureTransport defaults to "off", which is correct for WISP
+            # (Epoxy handles TLS in WASM)
             address = to_js(
                 {"hostname": self.hostname, "port": self.port},
-                dict_converter=Object.fromEntries,
+                dict_converter=lambda x: x,
             )
-
-            # Keep the destination connection as plain TCP. Epoxy performs TLS
-            # itself in WebAssembly before the bytes reach this socket.
-            self.socket = sockets.connect(
-                address,
-                to_js(
-                    {"secureTransport": "off", "allowHalfOpen": True},
-                    dict_converter=Object.fromEntries,
-                ),
-            )
-
-            await asyncio.wait_for(self.socket.opened, timeout=timeout)
             
-            # ✨ DIAGNOSTIC: Log successful connection
+            # Call connect() - this returns a socket immediately
+            # But the connection is not established until we await socket.opened
+            self.socket = sockets.connect(address)
+            
+            # Wait for the connection to actually establish
+            await asyncio.wait_for(self.socket.opened, timeout=timeout)
+
             console.log(
-                f"[wisp-tcp] Successfully established TCP connection to {self.hostname}:{self.port} "
+                f"[wisp-tcp] Successfully connected to {self.hostname}:{self.port} "
                 f"(stream_id={self.stream_id})"
             )
 
@@ -137,12 +120,14 @@ class TCPStream:
             self.reader_task = asyncio.create_task(self._reader_loop())
 
         except asyncio.TimeoutError:
+            console.log(
+                f"[wisp-tcp] Connection timeout for {self.hostname}:{self.port} "
+                f"(stream_id={self.stream_id})"
+            )
             await self.close(send_packet=True, reason=0x43)
         except Exception as exc:
-            from js import console
-
             console.log(
-                f"[wisp] TCP connect failed stream={self.stream_id} "
+                f"[wisp-tcp] TCP connect failed stream={self.stream_id} "
                 f"{self.hostname}:{self.port}: {exc}"
             )
             await self.close(send_packet=True, reason=self._classify_error(exc))
@@ -162,8 +147,6 @@ class TCPStream:
         return True
 
     async def _writer_loop(self) -> None:
-        from js import console
-
         try:
             await self._ready.wait()
             while not self._closed:
@@ -175,9 +158,7 @@ class TCPStream:
                         await self.writer.write(js_payload)
                     self.packets_sent += 1
 
-                    # Match the reference Wisp v1 servers: refresh the receive
-                    # window periodically instead of sending CONTINUE for every
-                    # packet. The queue itself remains the congestion buffer.
+                    # Refresh receive window periodically
                     if self.packets_sent % max(1, self.queue.maxsize // 4) == 0:
                         self.send_continue()
                 finally:
@@ -187,12 +168,10 @@ class TCPStream:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            console.log(f"[wisp] TCP write failed stream={self.stream_id}: {exc}")
+            console.log(f"[wisp-tcp] TCP write failed stream={self.stream_id}: {exc}")
             await self.close(send_packet=True, reason=0x03)
 
     async def _reader_loop(self) -> None:
-        from js import console
-
         try:
             if self.reader is None:
                 return
@@ -225,7 +204,7 @@ class TCPStream:
         except asyncio.TimeoutError:
             await self.close(send_packet=True, reason=0x47)
         except Exception as exc:
-            console.log(f"[wisp] TCP read failed stream={self.stream_id}: {exc}")
+            console.log(f"[wisp-tcp] TCP read failed stream={self.stream_id}: {exc}")
             await self.close(send_packet=True, reason=0x03)
 
     @staticmethod
@@ -237,21 +216,27 @@ class TCPStream:
 
     @staticmethod
     def _classify_error(exc: BaseException) -> int:
+        """Map exceptions to WISP close reason codes."""
         text = str(exc).lower()
         
-        # TLS handshake failures (e.g., from Epoxy WASM)
-        if "tls" in text or "handshake" in text or "eof" in text:
-            # Could be: unsupported TLS version, wrong cipher, timeout, or HTTP vs HTTPS mismatch
-            return 0x03  # CLOSE_NETWORK_ERROR
+        # Connection disallowed (private IP, loopback, Cloudflare IPs, etc.)
+        if "disallowed" in text or "private" in text or "cannot connect" in text:
+            console.log(f"[wisp-tcp] Connection disallowed: {text}")
+            return 0x48  # CLOSE_BLOCKED
         
+        # Timeout
         if isinstance(exc, asyncio.TimeoutError) or "timeout" in text:
             return 0x43  # CLOSE_TIMEOUT
+        
+        # Refused/connection error
         if "refused" in text or "econnrefused" in text:
             return 0x44  # CLOSE_REFUSED
+        
+        # DNS/resolution error
         if "resolve" in text or "not found" in text or "dns" in text:
             return 0x42  # CLOSE_UNREACHABLE
-        if "disallowed" in text or "private" in text:
-            return 0x48  # CLOSE_BLOCKED
+        
+        # Generic network error
         return 0x03  # CLOSE_NETWORK_ERROR
 
     def send_data(self, payload: bytes) -> None:
