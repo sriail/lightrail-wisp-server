@@ -1,8 +1,19 @@
 """
-Fixed TCP stream handler with proper TLS configuration.
+WISP TCP Stream - Correct Architecture
 
-The issue: Using secureTransport="off" on port 443 confuses Cloudflare.
-The solution: Automatically detect HTTPS ports and use secureTransport="on".
+The proper flow:
+1. Browser client → Worker (via WISP WebSocket) 
+2. Client encrypts traffic with TLS (via Epoxy WASM)
+3. Worker receives encrypted bytes
+4. Worker forwards to target via plain TCP (secureTransport="off")
+5. Target receives encrypted TLS data from Epoxy
+6. Target decrypts and processes the request
+
+We should NOT use secureTransport="on" because that would add a second layer of TLS,
+which causes "tls handshake eof" errors.
+
+The previous error "cannot connect to specified address" was likely a transient issue
+or a validation bug in Cloudflare. Let's try the correct approach with better error handling.
 """
 
 from __future__ import annotations
@@ -30,23 +41,6 @@ def load_tcp_module():
     return import_from_javascript("cloudflare:sockets")
 
 
-async def http_get(url: str, headers: dict[str, str] | None = None):
-    """Fetch an ordinary HTTP URL through Workers Fetch."""
-    from js import fetch
-    js_headers = to_js(headers or {}, dict_converter=Object.fromEntries)
-    return await fetch(
-        url,
-        to_js(
-            {
-                "method": "GET",
-                "headers": js_headers,
-                "redirect": "follow",
-            },
-            dict_converter=Object.fromEntries,
-        ),
-    )
-
-
 @contextmanager
 def js_uint8array(data: bytes):
     """Expose Python bytes as a native JS Uint8Array without a large JS list."""
@@ -61,9 +55,6 @@ def js_uint8array(data: bytes):
 
 class TCPStream:
     """One Wisp stream backed by a Cloudflare outbound TCP socket."""
-
-    # HTTPS ports that should use TLS
-    HTTPS_PORTS = {443, 8443, 9443}
 
     def __init__(
         self,
@@ -98,17 +89,6 @@ class TCPStream:
     def buffer_remaining(self) -> int:
         return max(0, self.queue.maxsize - self.queue.qsize())
 
-    def _should_use_tls(self) -> bool:
-        """
-        Determine if TLS should be used based on port.
-        
-        Port 443 and other HTTPS ports should use TLS.
-        The WISP protocol itself handles TLS at the application layer,
-        but for the TCP socket to Cloudflare, we need to match the target's
-        protocol expectations.
-        """
-        return self.port in self.HTTPS_PORTS
-
     async def open(self, timeout: float = CONNECT_TIMEOUT_SECONDS) -> None:
         if self._closed:
             return
@@ -116,13 +96,9 @@ class TCPStream:
         try:
             sockets = load_tcp_module()
 
-            # Determine if we should use TLS based on port
-            use_tls = self._should_use_tls()
-            secure_transport = "on" if use_tls else "off"
-
             console.log(
                 f"[wisp-tcp] Attempting connection to {self.hostname}:{self.port} "
-                f"(stream_id={self.stream_id}, timeout={timeout}s, tls={use_tls})"
+                f"(stream_id={self.stream_id}, timeout={timeout}s)"
             )
 
             address = to_js(
@@ -130,25 +106,24 @@ class TCPStream:
                 dict_converter=Object.fromEntries,
             )
 
-            # FIX: Use proper TLS setting based on port
-            # - Port 443, 8443, 9443: use TLS (secureTransport="on")
-            # - Other ports: no TLS (secureTransport="off")
+            # IMPORTANT: Use secureTransport="off" for PLAIN TCP
+            # The Epoxy WASM library (client-side) handles TLS encryption.
+            # The target server receives TLS-encrypted bytes from Epoxy.
             # 
-            # IMPORTANT: WISP expects the proxy to NOT do TLS (it does TLS in WASM).
-            # However, when connecting to HTTPS ports through Cloudflare's TCP socket API,
-            # we must tell Cloudflare to establish a TLS connection to the target.
-            # The encrypted data from the client (via Epoxy) will flow through this TLS tunnel.
+            # DO NOT use secureTransport="on" because:
+            # - It adds a second layer of TLS (Worker TLS + Epoxy TLS)
+            # - This causes "tls handshake eof" errors
+            # - The protocol architecture expects plain TCP
             options = to_js(
                 {
-                    "secureTransport": secure_transport,
+                    "secureTransport": "off",
                     "allowHalfOpen": True,
                 },
                 dict_converter=Object.fromEntries,
             )
 
             console.log(
-                f"[wisp-tcp] Socket options: secureTransport={secure_transport}, "
-                f"allowHalfOpen=True"
+                f"[wisp-tcp] Using secureTransport=off (plain TCP, Epoxy does TLS)"
             )
 
             self.socket = sockets.connect(address, options)
@@ -157,7 +132,7 @@ class TCPStream:
 
             console.log(
                 f"[wisp-tcp] Successfully established TCP connection to {self.hostname}:{self.port} "
-                f"(stream_id={self.stream_id}, tls={use_tls})"
+                f"(stream_id={self.stream_id})"
             )
 
             self.writer = self.socket.writable.getWriter()
@@ -175,6 +150,15 @@ class TCPStream:
                 f"[wisp-tcp] TCP connect failed stream={self.stream_id} "
                 f"{self.hostname}:{self.port}: {exc}"
             )
+            console.log(f"[wisp-tcp] Error details: {type(exc).__name__}: {str(exc)}")
+            
+            # Log more details for debugging
+            if "cannot connect" in str(exc).lower():
+                console.log(
+                    f"[wisp-tcp] Note: 'cannot connect' error may indicate Cloudflare "
+                    f"is blocking this destination or port {self.port} is not allowed"
+                )
+            
             await self.close(send_packet=True, reason=self._classify_error(exc))
 
     def enqueue(self, payload: bytes) -> bool:
@@ -261,13 +245,26 @@ class TCPStream:
     @staticmethod
     def _classify_error(exc: BaseException) -> int:
         text = str(exc).lower()
+        
+        # TLS errors from Epoxy (not our socket, but the client-side WASM)
+        if "tls" in text or "handshake" in text:
+            console.log(
+                f"[wisp] TLS handshake error detected. This is from Epoxy (client-side)."
+                f"Possible causes:"
+                f"  1. Target server not supporting TLS"
+                f"  2. Target server using unsupported TLS version"
+                f"  3. Target server certificate issues"
+                f"  4. SNI hostname mismatch"
+            )
+            return 0x03  # CLOSE_NETWORK_ERROR
+        
         if isinstance(exc, asyncio.TimeoutError) or "timeout" in text:
             return 0x43
         if "refused" in text or "econnrefused" in text:
             return 0x44
         if "resolve" in text or "not found" in text or "dns" in text:
             return 0x42
-        if "disallowed" in text or "private" in text or "proxy request failed" in text:
+        if "disallowed" in text or "private" in text or "cannot connect" in text:
             return 0x48
         return 0x03
 
