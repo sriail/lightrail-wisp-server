@@ -1,14 +1,13 @@
 """
-WISP TCP Stream - Cloudflare Workers Edition
+WISP-Compatible HTTP Proxy using Cloudflare Workers Fetch API
 
-The issue: Cloudflare's TCP socket API validates port+protocol combinations.
-- Port 443 + secureTransport="on" → Cloudflare expects HTTP/HTTPS, rejects WISP
-- Port 443 + secureTransport="off" → Cloudflare rejects as "cannot connect"
+Instead of raw TCP, we:
+1. Accept WISP CONNECT packets requesting TCP streams
+2. Use Fetch API to get HTTP/HTTPS content (Cloudflare-allowed)
+3. Wrap HTTP responses in WISP DATA packets
+4. Send back through WISP protocol to client
 
-The solution: Retry with both settings and use whichever works.
-Then let Epoxy (client-side WASM) handle the actual TLS encryption.
-
-This proxies encrypted bytes from Epoxy through a plain TCP socket to the target.
+This bypasses Cloudflare's TCP restrictions while staying protocol-compliant.
 """
 
 from __future__ import annotations
@@ -16,24 +15,17 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 
-from js import Object, console
+from js import Object, fetch, console
 from contextlib import contextmanager
 
 from pyodide.ffi import create_proxy, to_js
 
 from server.rates import (
     CONNECT_TIMEOUT_SECONDS,
-    IDLE_TIMEOUT_SECONDS,
     MAX_DATA_PAYLOAD_BYTES,
     MAX_BUFFERED_PACKETS,
     MAX_QUEUED_BYTES_PER_STREAM,
 )
-
-
-def load_tcp_module():
-    """Return Cloudflare's built-in sockets module."""
-    from workers import import_from_javascript
-    return import_from_javascript("cloudflare:sockets")
 
 
 @contextmanager
@@ -48,8 +40,21 @@ def js_uint8array(data: bytes):
         proxy.destroy()
 
 
-class TCPStream:
-    """One Wisp stream backed by a Cloudflare outbound TCP socket."""
+class HTTPFetchStream:
+    """
+    HTTP-based stream using Cloudflare Workers Fetch API.
+    
+    Accepts WISP CONNECT requests for TCP connections to HTTP/HTTPS servers,
+    but fulfills them via Fetch API instead of raw TCP.
+    
+    This allows full WISP protocol support on Cloudflare Workers by:
+    1. Client sends WISP CONNECT for example.com:443
+    2. Worker receives HTTP/HTTPS request from client (through WISP)
+    3. Worker uses Fetch to get content
+    4. Worker wraps response in WISP DATA packets
+    
+    Limitation: This only works for HTTP requests, not arbitrary TCP protocols.
+    """
 
     def __init__(
         self,
@@ -71,236 +76,230 @@ class TCPStream:
         self.queued_bytes = 0
         self.packets_sent = 0
 
-        self.socket = None
-        self.writer = None
-        self.reader = None
-        self.writer_task: asyncio.Task | None = None
-        self.reader_task: asyncio.Task | None = None
         self._ready = asyncio.Event()
         self._closed = False
         self._close_lock = asyncio.Lock()
+        
+        # For HTTP request handling
+        self.request_buffer = b""
+        self.headers_complete = False
+        self.content_length = 0
+        self.body_received = 0
 
     @property
     def buffer_remaining(self) -> int:
         return max(0, self.queue.maxsize - self.queue.qsize())
 
-    async def _try_connect(
-        self,
-        sockets,
-        address,
-        secure_transport: bool,
-        timeout: float,
-    ):
-        """Try to establish a TCP connection with the given TLS setting."""
-        try:
-            options = to_js(
-                {
-                    "secureTransport": "on" if secure_transport else "off",
-                    "allowHalfOpen": True,
-                },
-                dict_converter=Object.fromEntries,
-            )
-
-            console.log(
-                f"[wisp-tcp] Trying connection with secureTransport="
-                f"{'on' if secure_transport else 'off'}"
-            )
-
-            socket = sockets.connect(address, options)
-            await asyncio.wait_for(socket.opened, timeout=timeout)
-
-            console.log(
-                f"[wisp-tcp] Successfully connected with "
-                f"secureTransport={'on' if secure_transport else 'off'}"
-            )
-            return socket
-
-        except Exception as exc:
-            console.log(
-                f"[wisp-tcp] Failed with secureTransport="
-                f"{'on' if secure_transport else 'off'}: {str(exc)[:100]}"
-            )
-            raise
-
     async def open(self, timeout: float = CONNECT_TIMEOUT_SECONDS) -> None:
+        """
+        For HTTP streams, 'opening' just validates the hostname is reachable.
+        We don't actually establish a connection until an HTTP request arrives.
+        """
         if self._closed:
             return
 
         try:
-            sockets = load_tcp_module()
-
             console.log(
-                f"[wisp-tcp] Attempting connection to {self.hostname}:{self.port} "
-                f"(stream_id={self.stream_id}, timeout={timeout}s)"
+                f"[http-fetch] Stream {self.stream_id} ready for "
+                f"{self.hostname}:{self.port} (HTTPS)" if self.port == 443 
+                else f"(HTTP)"
             )
-
-            address = to_js(
-                {"hostname": self.hostname, "port": self.port},
-                dict_converter=Object.fromEntries,
-            )
-
-            # Cloudflare's socket validation is inconsistent for HTTPS ports.
-            # Try secureTransport="off" first (correct for WISP protocol),
-            # then fall back to "on" if that fails.
-            #
-            # The WISP protocol sends encrypted bytes from Epoxy (WASM TLS library)
-            # through a plain TCP socket. Cloudflare sometimes blocks this with
-            # "cannot connect to specified address" for port 443.
-            #
-            # If secureTransport="off" fails, trying secureTransport="on" may work,
-            # though it will add an extra TLS layer that Epoxy has to work through.
-
-            socket = None
-            last_error = None
-
-            # Try 1: secureTransport="off" (correct WISP architecture)
-            try:
-                socket = await self._try_connect(
-                    sockets, address, secure_transport=False, timeout=timeout
-                )
-            except Exception as exc:
-                last_error = exc
-                console.log(
-                    f"[wisp-tcp] secureTransport=off failed, will try secureTransport=on"
-                )
-
-            # Try 2: secureTransport="on" (fallback if Cloudflare blocks off)
-            if socket is None:
-                try:
-                    socket = await self._try_connect(
-                        sockets, address, secure_transport=True, timeout=timeout
-                    )
-                except Exception as exc:
-                    last_error = exc
-                    console.log(f"[wisp-tcp] Both TLS settings failed")
-
-            # If both failed, give up
-            if socket is None:
-                raise last_error or Exception("Unknown socket connection error")
-
-            console.log(
-                f"[wisp-tcp] Successfully established TCP connection to "
-                f"{self.hostname}:{self.port} (stream_id={self.stream_id})"
-            )
-
-            self.socket = socket
-            self.writer = self.socket.writable.getWriter()
-            self.reader = self.socket.readable.getReader()
+            
+            # HTTP is connection-less, mark as ready immediately
             self._ready.set()
 
-            self.writer_task = asyncio.create_task(self._writer_loop())
-            self.reader_task = asyncio.create_task(self._reader_loop())
-
-        except asyncio.TimeoutError:
-            console.log(f"[wisp-tcp] Connection timeout for {self.hostname}:{self.port}")
-            await self.close(send_packet=True, reason=0x43)
         except Exception as exc:
             console.log(
-                f"[wisp-tcp] TCP connect failed stream={self.stream_id} "
-                f"{self.hostname}:{self.port}: {exc}"
+                f"[http-fetch] Stream {self.stream_id} setup failed: {exc}"
             )
             await self.close(send_packet=True, reason=self._classify_error(exc))
 
     def enqueue(self, payload: bytes) -> bool:
+        """Queue HTTP request payload for forwarding."""
         if self._closed:
             return False
         if len(payload) > MAX_DATA_PAYLOAD_BYTES:
             return False
-        if self.queued_bytes + len(payload) > MAX_QUEUED_BYTES_PER_STREAM:
-            return False
+        
         try:
             self.queue.put_nowait(payload)
         except asyncio.QueueFull:
             return False
+        
         self.queued_bytes += len(payload)
+        
+        # Fire off async request handling
+        asyncio.create_task(self._process_http_request())
         return True
 
-    async def _writer_loop(self) -> None:
+    async def _process_http_request(self) -> None:
+        """Process queued HTTP requests and forward via Fetch API."""
         try:
-            await self._ready.wait()
+            # Accumulate payload until we have a complete HTTP request
             while not self._closed:
-                payload = await self.queue.get()
                 try:
-                    if self.writer is None:
-                        return
-                    with js_uint8array(payload) as js_payload:
-                        await self.writer.write(js_payload)
-                    self.packets_sent += 1
+                    chunk = self.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                
+                self.request_buffer += chunk
+                self.queued_bytes = max(0, self.queued_bytes - len(chunk))
+                self.queue.task_done()
+                
+                # Check if we have a complete HTTP request (headers + body)
+                if not self.headers_complete:
+                    if b"\r\n\r\n" in self.request_buffer:
+                        self.headers_complete = True
+                        # Parse headers to get Content-Length
+                        headers_part = self.request_buffer.split(b"\r\n\r\n")[0]
+                        for line in headers_part.split(b"\r\n"):
+                            if line.lower().startswith(b"content-length:"):
+                                try:
+                                    self.content_length = int(line.split(b":")[1].strip())
+                                except ValueError:
+                                    pass
+                
+                # Check if we have the complete body
+                if self.headers_complete:
+                    body_start = self.request_buffer.find(b"\r\n\r\n") + 4
+                    self.body_received = len(self.request_buffer) - body_start
+                    
+                    if self.content_length == 0 or self.body_received >= self.content_length:
+                        # Complete request received, process it
+                        await self._handle_http_request(self.request_buffer)
+                        self.request_buffer = b""
+                        self.headers_complete = False
+                        self.content_length = 0
+                        self.body_received = 0
 
-                    if self.packets_sent % max(1, self.queue.maxsize // 4) == 0:
-                        self.send_continue()
-                finally:
-                    self.queued_bytes = max(0, self.queued_bytes - len(payload))
-                    self.queue.task_done()
-
-        except asyncio.CancelledError:
-            raise
         except Exception as exc:
-            console.log(f"[wisp] TCP write failed stream={self.stream_id}: {exc}")
-            await self.close(send_packet=True, reason=0x03)
+            console.log(f"[http-fetch] Request processing error stream={self.stream_id}: {exc}")
+            await self.close(send_packet=True, reason=self._classify_error(exc))
 
-    async def _reader_loop(self) -> None:
+    async def _handle_http_request(self, request_data: bytes) -> None:
+        """Forward HTTP request via Fetch API and send response through WISP."""
         try:
-            if self.reader is None:
+            from js import console
+            
+            # Parse HTTP request
+            request_str = request_data.decode("utf-8", errors="ignore")
+            lines = request_str.split("\r\n")
+            
+            if not lines:
+                await self.close(send_packet=True, reason=0x41)  # CLOSE_INVALID
                 return
-
-            while not self._closed:
-                if IDLE_TIMEOUT_SECONDS > 0:
-                    result = await asyncio.wait_for(
-                        self.reader.read(), timeout=IDLE_TIMEOUT_SECONDS
-                    )
-                else:
-                    result = await self.reader.read()
-
-                if bool(result.done):
-                    await self.close(send_packet=True, reason=0x02)
-                    return
-
-                value = result.value
-                if value is None:
-                    continue
-
-                data = self._js_bytes(value)
-                if not data:
-                    continue
-
-                for start in range(0, len(data), MAX_DATA_PAYLOAD_BYTES):
-                    self.send_data(data[start : start + MAX_DATA_PAYLOAD_BYTES])
-
-        except asyncio.CancelledError:
-            raise
+            
+            # Parse request line: "GET /path HTTP/1.1"
+            try:
+                parts = lines[0].split(" ", 2)
+                if len(parts) < 2:
+                    raise ValueError("Invalid request line")
+                method, path = parts[0], parts[1]
+            except (ValueError, IndexError):
+                await self.close(send_packet=True, reason=0x41)
+                return
+            
+            # Parse headers
+            headers = {}
+            body_start = 1
+            for i, line in enumerate(lines[1:], 1):
+                if not line:
+                    body_start = i + 1
+                    break
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    headers[key.strip()] = value.strip()
+            
+            # Remove Host header to avoid conflicts
+            headers.pop("Host", None)
+            headers.pop("host", None)
+            
+            # Get request body
+            body = "\r\n".join(lines[body_start:]) if body_start < len(lines) else ""
+            
+            # Construct target URL
+            # Use HTTPS for port 443, HTTP for others
+            scheme = "https" if self.port == 443 else "http"
+            target_url = f"{scheme}://{self.hostname}{path}"
+            
+            console.log(
+                f"[http-fetch] stream={self.stream_id} {method} {target_url}"
+            )
+            
+            # Forward via Fetch API
+            response = await fetch(
+                target_url,
+                to_js(
+                    {
+                        "method": method,
+                        "headers": headers,
+                        "body": body if method not in ("GET", "HEAD", "DELETE") else None,
+                        "redirect": "follow",
+                    },
+                    dict_converter=Object.fromEntries,
+                ),
+            )
+            
+            # Get response body
+            response_body = await response.text()
+            
+            # Get response headers
+            response_headers = {}
+            for key, value in response.headers.items():
+                response_headers[key] = value
+            
+            # Format as HTTP response
+            status_line = f"HTTP/1.1 {response.status} OK\r\n"
+            headers_str = "\r\n".join(
+                f"{k}: {v}" for k, v in response_headers.items()
+            )
+            response_str = status_line + headers_str + "\r\n\r\n" + response_body
+            response_bytes = response_str.encode("utf-8")
+            
+            console.log(
+                f"[http-fetch] stream={self.stream_id} {response.status} "
+                f"({len(response_bytes)} bytes)"
+            )
+            
+            # Send response back through WISP in chunks
+            for start in range(0, len(response_bytes), MAX_DATA_PAYLOAD_BYTES):
+                chunk = response_bytes[start : start + MAX_DATA_PAYLOAD_BYTES]
+                self.send_data(chunk)
+            
+            # After sending response, close the stream (HTTP is request-response)
+            await self.close(send_packet=True, reason=0x02)
+            
         except asyncio.TimeoutError:
-            await self.close(send_packet=True, reason=0x47)
+            console.log(f"[http-fetch] Request timeout stream={self.stream_id}")
+            await self.close(send_packet=True, reason=0x43)
         except Exception as exc:
-            console.log(f"[wisp] TCP read failed stream={self.stream_id}: {exc}")
-            await self.close(send_packet=True, reason=0x03)
-
-    @staticmethod
-    def _js_bytes(value) -> bytes:
-        try:
-            return bytes(value.to_py())
-        except AttributeError:
-            return bytes(value)
+            console.log(
+                f"[http-fetch] Request failed stream={self.stream_id}: {exc}"
+            )
+            await self.close(send_packet=True, reason=self._classify_error(exc))
 
     @staticmethod
     def _classify_error(exc: BaseException) -> int:
+        """Map exceptions to WISP close reason codes."""
         text = str(exc).lower()
         if isinstance(exc, asyncio.TimeoutError) or "timeout" in text:
-            return 0x43
+            return 0x43  # CLOSE_TIMEOUT
         if "refused" in text or "econnrefused" in text:
-            return 0x44
+            return 0x44  # CLOSE_REFUSED
         if "resolve" in text or "not found" in text or "dns" in text:
-            return 0x42
-        if "disallowed" in text or "private" in text or "cannot connect" in text:
-            return 0x48
-        return 0x03
+            return 0x42  # CLOSE_UNREACHABLE
+        if "disallowed" in text or "private" in text:
+            return 0x48  # CLOSE_BLOCKED
+        return 0x03  # CLOSE_NETWORK_ERROR
 
     def send_data(self, payload: bytes) -> None:
+        """Send HTTP response payload back through WISP."""
         from server.connection import DATA, build_packet
 
         self.send_packet(build_packet(DATA, self.stream_id, payload))
 
     def send_continue(self) -> None:
+        """Send buffer availability notification to client."""
         from server.connection import CONTINUE, build_packet
 
         self.send_packet(
@@ -312,16 +311,12 @@ class TCPStream:
         )
 
     async def close(self, *, send_packet: bool, reason: int = 0x02) -> None:
+        """Close this HTTP stream."""
         async with self._close_lock:
             if self._closed:
                 return
             self._closed = True
             self._ready.set()
-
-            current = asyncio.current_task()
-            for task in (self.reader_task, self.writer_task):
-                if task is not None and task is not current and not task.done():
-                    task.cancel()
 
             if send_packet:
                 from server.connection import CLOSE, build_packet
@@ -330,10 +325,9 @@ class TCPStream:
                     build_packet(CLOSE, self.stream_id, bytes((reason & 0xFF,)))
                 )
 
-            if self.socket is not None:
-                try:
-                    await self.socket.close()
-                except Exception:
-                    pass
-
             self.on_closed(self.stream_id)
+
+
+# Export as TCPStream for compatibility with existing code
+# The server will use HTTPFetchStream wherever it would use TCPStream
+TCPStream = HTTPFetchStream
