@@ -99,11 +99,14 @@ class HTTPFetchStream:
             return
 
         try:
+            protocol = "HTTPS" if self.port == 443 else "HTTP"
             console.log(
                 f"[http-fetch] Stream {self.stream_id} ready for "
-                f"{self.hostname}:{self.port} (HTTPS)" if self.port == 443 
-                else f"(HTTP)"
+                f"{self.hostname}:{self.port} ({protocol})"
             )
+            
+            # Start the request processing task
+            asyncio.create_task(self._process_http_request())
             
             # HTTP is connection-less, mark as ready immediately
             self._ready.set()
@@ -127,23 +130,34 @@ class HTTPFetchStream:
             return False
         
         self.queued_bytes += len(payload)
-        
-        # Fire off async request handling
-        asyncio.create_task(self._process_http_request())
         return True
 
     async def _process_http_request(self) -> None:
         """Process queued HTTP requests and forward via Fetch API."""
         try:
+            # Wait for the first chunk
+            await self._ready.wait()
+            
             # Accumulate payload until we have a complete HTTP request
             while not self._closed:
                 try:
-                    chunk = self.queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+                    # Wait for next chunk (blocking)
+                    chunk = await asyncio.wait_for(self.queue.get(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    console.log(f"[http-fetch] Request timeout stream={self.stream_id}")
+                    await self.close(send_packet=True, reason=0x43)
+                    return
+                except asyncio.CancelledError:
+                    return
                 
                 self.request_buffer += chunk
                 self.queued_bytes = max(0, self.queued_bytes - len(chunk))
+                
+                console.log(
+                    f"[http-fetch] stream={self.stream_id} received chunk "
+                    f"({len(chunk)} bytes, total buffered: {len(self.request_buffer)})"
+                )
+                
                 self.queue.task_done()
                 
                 # Check if we have a complete HTTP request (headers + body)
@@ -156,6 +170,10 @@ class HTTPFetchStream:
                             if line.lower().startswith(b"content-length:"):
                                 try:
                                     self.content_length = int(line.split(b":")[1].strip())
+                                    console.log(
+                                        f"[http-fetch] stream={self.stream_id} "
+                                        f"Content-Length: {self.content_length}"
+                                    )
                                 except ValueError:
                                     pass
                 
@@ -164,8 +182,18 @@ class HTTPFetchStream:
                     body_start = self.request_buffer.find(b"\r\n\r\n") + 4
                     self.body_received = len(self.request_buffer) - body_start
                     
+                    console.log(
+                        f"[http-fetch] stream={self.stream_id} "
+                        f"body_received={self.body_received}, "
+                        f"content_length={self.content_length}"
+                    )
+                    
                     if self.content_length == 0 or self.body_received >= self.content_length:
                         # Complete request received, process it
+                        console.log(
+                            f"[http-fetch] stream={self.stream_id} "
+                            f"complete request received, processing..."
+                        )
                         await self._handle_http_request(self.request_buffer)
                         self.request_buffer = b""
                         self.headers_complete = False
@@ -174,6 +202,9 @@ class HTTPFetchStream:
 
         except Exception as exc:
             console.log(f"[http-fetch] Request processing error stream={self.stream_id}: {exc}")
+            console.log(f"[http-fetch] Exception type: {type(exc).__name__}")
+            import traceback
+            console.log(f"[http-fetch] Traceback: {traceback.format_exc()}")
             await self.close(send_packet=True, reason=self._classify_error(exc))
 
     async def _handle_http_request(self, request_data: bytes) -> None:
