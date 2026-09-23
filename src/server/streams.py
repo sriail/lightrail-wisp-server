@@ -153,12 +153,37 @@ class HTTPFetchStream:
                 self.request_buffer += chunk
                 self.queued_bytes = max(0, self.queued_bytes - len(chunk))
                 
+                # Log the actual data received
+                chunk_preview = chunk[:100] if len(chunk) <= 100 else chunk[:100] + b"..."
+                try:
+                    chunk_str = chunk_preview.decode('utf-8', errors='replace')
+                except:
+                    chunk_str = repr(chunk_preview)
+                
                 console.log(
                     f"[http-fetch] stream={self.stream_id} received chunk "
                     f"({len(chunk)} bytes, total buffered: {len(self.request_buffer)})"
                 )
+                console.log(f"[http-fetch] chunk preview: {chunk_str}")
                 
                 self.queue.task_done()
+                
+                # Check if this looks like HTTP or encrypted data
+                if self.request_buffer.startswith(b"GET ") or self.request_buffer.startswith(b"POST ") or \
+                   self.request_buffer.startswith(b"PUT ") or self.request_buffer.startswith(b"DELETE ") or \
+                   self.request_buffer.startswith(b"HEAD ") or self.request_buffer.startswith(b"PATCH "):
+                    console.log(f"[http-fetch] stream={self.stream_id} detected HTTP request")
+                elif self.request_buffer and not self.request_buffer.startswith(b"HTTP"):
+                    # Might be encrypted - check if it starts with TLS record marker
+                    if self.request_buffer[0:1] in (b'\x16', b'\x17', b'\x18', b'\x19', b'\x1a'):
+                        console.log(
+                            f"[http-fetch] stream={self.stream_id} WARNING: "
+                            f"received TLS encrypted data (byte: {hex(self.request_buffer[0])}), "
+                            f"not plaintext HTTP. Epoxy is sending encrypted bytes through WISP!"
+                        )
+                        # This is a protocol error - we can't handle encrypted data
+                        await self.close(send_packet=True, reason=0x41)  # CLOSE_INVALID
+                        return
                 
                 # Check if we have a complete HTTP request (headers + body)
                 if not self.headers_complete:
@@ -361,4 +386,5 @@ class HTTPFetchStream:
 
 # Export as TCPStream for compatibility with existing code
 # The server will use HTTPFetchStream wherever it would use TCPStream
+TCPStream = HTTPFetchStream
 TCPStream = HTTPFetchStream
