@@ -8,4 +8,3 @@
 # Optional: For local development/testing
 aiohttp>=3.9.0
 websockets>=11.0
-workers>=1.9.0
