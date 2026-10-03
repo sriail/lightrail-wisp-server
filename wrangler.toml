@@ -14,12 +14,6 @@ routes = [
   { pattern = "your-domain.com/wisp/*", zone_name = "your-domain.com" }
 ]
 
-[env.development]
-vars = { ENVIRONMENT = "development", PYTHONUNBUFFERED = "1" }
-routes = [
-  { pattern = "/wisp/*", zone_id = "your-zone-id" }
-]
-
 # Python build settings
 [build]
 command = "pip install -r requirements.txt"
