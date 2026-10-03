@@ -1,0 +1,1 @@
+# Placeholder File For Udp support which cloudflare is adding to workers, Plan to update this on further notice of connect api implamentation. Current Date: Oct 3, 2026, Expected Update Date: Dec 28, 2026 - Mar 3, 2027

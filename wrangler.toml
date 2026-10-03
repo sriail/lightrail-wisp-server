@@ -1,8 +1,29 @@
 name = "lightrail-wisp-server"
-main = "src/worker.py"
+main = "./src/worker.py"
+type = "python"
+compatibility_date = "2026-07-01"
 
-compatibility_date = "2026-04-20"
-compatibility_flags = ["python_workers"]
+# Enable TCP sockets
+[env.production.vars]
+ENVIRONMENT = "production"
 
-[python_modules]
-exclude = ["**/*.pyc", "**/__pycache__"]
+# Routes
+routes = [
+  { pattern = "/wisp/*", zone_name = "your-domain.com" }
+]
+
+# Python-specific settings
+[build]
+command = "pip install -r requirements.txt"
+
+# Limits and performance
+vars = { PYTHONUNBUFFERED = "1" }
+
+# Observability
+[observability]
+enabled = true
+
+# Durable Objects (if needed for connection pooling)
+# [[durable_objects.bindings]]
+# name = "CONNECTION_POOL"
+# class_name = "ConnectionPool"
