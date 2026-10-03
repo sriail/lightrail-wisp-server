@@ -1,7 +1,6 @@
 import asyncio
 import logging
-from typing import Dict, Optional, Set
-from workers import WebSocket
+from typing import Dict, Optional
 from wisp_protocol import WispPacket, PacketType, CloseReason
 from tcp import TCPConnectionPool
 from http import HTTPConnectionPool
@@ -70,7 +69,7 @@ class WispServer:
         self.client_buffers: Dict[int, int] = {}  # stream_id -> remaining buffer
         self.websocket = None
     
-    async def handle_connection(self, websocket: WebSocket):
+    async def handle_connection(self, websocket):
         """Handle incoming WebSocket connection"""
         self.websocket = websocket
         
@@ -82,11 +81,27 @@ class WispServer:
             logger.info("WISP connection established, sent initial CONTINUE packet")
             
             # Handle incoming messages
-            async for message in websocket:
-                try:
-                    await self.handle_packet(message)
-                except Exception as e:
-                    logger.error(f"Error handling packet: {e}")
+            # Support both async iterator and recv() patterns
+            if hasattr(websocket, '__aiter__'):
+                # Pattern 1: async iterator (websockets library)
+                async for message in websocket:
+                    try:
+                        await self.handle_packet(message)
+                    except Exception as e:
+                        logger.error(f"Error handling packet: {e}")
+            else:
+                # Pattern 2: recv() method (workers-py)
+                while True:
+                    try:
+                        message = await websocket.recv()
+                        if message is None:
+                            break
+                        await self.handle_packet(message)
+                    except Exception as e:
+                        if "closed" in str(e).lower():
+                            logger.info("WebSocket connection closed")
+                            break
+                        logger.error(f"Error receiving message: {e}")
         
         except Exception as e:
             logger.error(f"WebSocket connection error: {e}")

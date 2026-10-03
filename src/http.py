@@ -1,7 +1,19 @@
 import asyncio
 from typing import Dict, Optional, Tuple
-from workers import fetch
 import logging
+
+# Import fetch from the appropriate source
+try:
+    from workers import fetch
+except ImportError:
+    # Fallback to built-in fetch (available in most JS runtimes)
+    try:
+        # This will work if we're running in a context with global fetch
+        fetch = globals().get('fetch')
+        if fetch is None:
+            raise ImportError("fetch not available")
+    except:
+        raise ImportError("Cannot import fetch. Ensure you're running on Cloudflare Workers.")
 
 logger = logging.getLogger(__name__)
 

@@ -10,7 +10,8 @@ exclude = ["**/*.pyc", "**/__pycache__"]
 [env.production.vars]
 ENVIRONMENT = "production"
 
-# Routes
+[env.production]
+vars = { ENVIRONMENT = "production", PYTHONUNBUFFERED = "1" }
 routes = [
   { pattern = "/wisp/*", zone_name = "your-domain.com" }
 ]
@@ -25,6 +26,8 @@ vars = { PYTHONUNBUFFERED = "1" }
 # Observability
 [observability]
 enabled = true
+
+python_external_sdk = true
 
 # Durable Objects (if needed for connection pooling)
 # [[durable_objects.bindings]]
