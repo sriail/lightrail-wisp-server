@@ -9,7 +9,10 @@ exclude = ["**/*.pyc", "**/__pycache__"
 # Python Workers Configuration
 [env.production]
 vars = { ENVIRONMENT = "production", PYTHONUNBUFFERED = "1" }
-routes = [ { pattern = "/wisp/*", zone_name = "your-domain.com" } ]
+
+routes = [
+  { pattern = "your-domain.com/wisp/*", zone_name = "your-domain.com" }
+]
 
 [env.development]
 vars = { ENVIRONMENT = "development", PYTHONUNBUFFERED = "1" }
