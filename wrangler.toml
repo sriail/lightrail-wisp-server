@@ -2,6 +2,9 @@ name = "lightrail-wisp-server"
 main = "worker.py"
 type = "python"
 compatibility_date = "2026-10-01"
+compatibility_flags = ["python_workers"]
+[python_modules]
+exclude = ["**/*.pyc", "**/__pycache__"
 
 # Python Workers Configuration
 [env.production]
