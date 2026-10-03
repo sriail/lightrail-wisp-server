@@ -1,35 +1,37 @@
 name = "lightrail-wisp-server"
-main = "./src/worker.py"
+main = "worker.py"
 type = "python"
-compatibility_date = "2026-07-01"
-compatibility_flags = ["python_workers"]
-[python_modules]
-exclude = ["**/*.pyc", "**/__pycache__"]
+compatibility_date = "2026-10-01"
 
-# Enable TCP sockets
-[env.production.vars]
-ENVIRONMENT = "production"
-
+# Python Workers Configuration
 [env.production]
 vars = { ENVIRONMENT = "production", PYTHONUNBUFFERED = "1" }
 routes = [
   { pattern = "/wisp/*", zone_name = "your-domain.com" }
 ]
 
-# Python-specific settings
+[env.development]
+vars = { ENVIRONMENT = "development", PYTHONUNBUFFERED = "1" }
+routes = [
+  { pattern = "/wisp/*", zone_id = "your-zone-id" }
+]
+
+# Python build settings
 [build]
 command = "pip install -r requirements.txt"
 
+# Enable Python external SDK (workers-py >= 1.9)
+python_external_sdk = true
+
 # Limits and performance
-vars = { PYTHONUNBUFFERED = "1" }
+# [limits]
+# cpu_ms = 30000
 
 # Observability
 [observability]
 enabled = true
 
-python_external_sdk = true
-
-# Durable Objects (if needed for connection pooling)
+# Durable Objects (optional, for connection pooling)
 # [[durable_objects.bindings]]
 # name = "CONNECTION_POOL"
 # class_name = "ConnectionPool"
