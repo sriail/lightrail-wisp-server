@@ -4,7 +4,7 @@ type = "python"
 compatibility_date = "2026-10-01"
 compatibility_flags = ["python_workers"]
 [python_modules]
-exclude = ["**/*.pyc", "**/__pycache__"
+exclude = ["**/*.pyc", "**/__pycache__"]
 
 # Python Workers Configuration
 [env.production]
@@ -19,7 +19,6 @@ vars = { ENVIRONMENT = "development", PYTHONUNBUFFERED = "1" }
 routes = [
   { pattern = "/wisp/*", zone_id = "your-zone-id" }
 ]
-
 
 # Python build settings
 [build]
