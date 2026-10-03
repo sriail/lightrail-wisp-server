@@ -1,44 +1,19 @@
 name = "lightrail-wisp-server"
 main = "src/worker.py"
-type = "python"
+
 compatibility_date = "2026-10-01"
 compatibility_flags = ["python_workers"]
-requires-python = ">=3.13"
-dependencies = [
-    "workers-runtime-sdk"
-]
-
-[dependency-groups]
-dev = [
-    "workers-py"
-]
 
 [python_modules]
 exclude = ["**/*.pyc", "**/__pycache__"]
 
-# Python Workers Configuration
-[env.production]
-vars = { ENVIRONMENT = "production", PYTHONUNBUFFERED = "1" }
-routes = [
-  { pattern = "/wisp/*", zone_name = "your-domain.com" }
-]
+[env.production.vars]
+ENVIRONMENT = "production"
+PYTHONUNBUFFERED = "1"
 
-[env.development]
-vars = { ENVIRONMENT = "development", PYTHONUNBUFFERED = "1" }
-routes = [
-  { pattern = "/wisp/*", zone_id = "your-zone-id" }
-]
+[env.development.vars]
+ENVIRONMENT = "development"
+PYTHONUNBUFFERED = "1"
 
-
-# Limits and performance (For Pro Plan)
-# [limits]
-# cpu_ms = 30000
-
-# Observability
 [observability]
 enabled = true
-
-# Durable Objects (optional, for connection pooling)
-# [[durable_objects.bindings]]
-# name = "CONNECTION_POOL"
-# class_name = "ConnectionPool"
