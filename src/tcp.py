@@ -2,20 +2,27 @@ import asyncio
 from typing import Dict, Optional, Tuple
 import logging
 
-# Try to import from cloudflare workers runtime
+logger = logging.getLogger(__name__)
+
+# Import connect from Cloudflare's built-in runtime
+# This will be available when running on Cloudflare Workers Python runtime
 try:
-    from workers import connect
-except ImportError:
-    try:
-        # Alternative import for cloudflare:sockets
+    # The runtime provides this as a global in some versions
+    import sys
+    if 'cloudflare' in sys.modules:
         from cloudflare.sockets import connect
-    except ImportError:
-        # Fallback: define a placeholder that will raise an error
-        async def connect(*args, **kwargs):
-            raise RuntimeError(
-                "TCP socket API not available. "
-                "This requires Cloudflare Workers with TCP sockets enabled."
-            )
+    else:
+        # Try the direct import
+        from cloudflare.sockets import connect
+except (ImportError, AttributeError):
+    # Fallback: provide a helpful error
+    logger.warning("TCP socket API not available - TCP connections will fail")
+    
+    async def connect(*args, **kwargs):
+        raise RuntimeError(
+            "TCP socket API not available. "
+            "Ensure you're running on Cloudflare Workers with TCP sockets enabled."
+        )
 
 logger = logging.getLogger(__name__)
 

@@ -1,90 +1,104 @@
 import logging
-from workers import Request, Response
-from server import WispServer
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-async def on_request(request: Request) -> Response:
+
+async def handle(request):
     """
-    Main handler for Cloudflare Worker
+    Main handler for Cloudflare Worker (Python runtime)
     
-    Deployment:
-    - Deploy to Cloudflare Workers
-    - Routes should point to /:path* or /wisp/*
-    - Supports WebSocket upgrade for WISP protocol
+    This is the entry point when disable_python_external_sdk = true.
+    The request object and response handling are provided by Cloudflare's runtime.
     """
     
-    # Check if this is a WebSocket upgrade request
-    upgrade = request.headers.get("Upgrade")
-    
-    if upgrade and upgrade.lower() == "websocket":
-        try:
-            # Get WebSocket from request context
-            websocket = request.context.get("websocket")
-            
-            if not websocket:
-                # Try using WebSocketPair for upgrade
-                try:
-                    from workers import WebSocketPair
-                    
-                    # Accept the WebSocket
-                    pair = WebSocketPair()
-                    server_ws = pair.server
-                    client_ws = pair.client
-                    
-                    # Create and run WISP server
-                    server = WispServer()
-                    
-                    # Run server in background
-                    import asyncio
-                    asyncio.create_task(server.handle_connection(server_ws))
-                    
-                    # Return response that upgrades the connection
-                    return Response(None, status=101, headers={
-                        "Upgrade": "websocket",
-                        "Connection": "Upgrade",
-                    })
-                
-                except ImportError:
-                    logger.warning("WebSocketPair not available, using alternative method")
-                    return Response(
-                        "WebSocket upgrade not supported on this runtime",
-                        status=400,
-                        headers={"Content-Type": "text/plain"}
-                    )
-            
-            # Create and run WISP server
-            server = WispServer()
-            await server.handle_connection(websocket)
-            
-            return Response("Connection closed", status=200)
+    try:
+        # Get request method and path
+        method = getattr(request, 'method', 'GET')
+        url = getattr(request, 'url', '')
         
-        except Exception as e:
-            logger.error(f"WebSocket error: {e}")
-            return Response(
-                f"WebSocket error: {str(e)}\n",
-                status=500,
-                headers={"Content-Type": "text/plain"}
-            )
+        logger.info(f"Request: {method} {url}")
+        
+        # Check for WebSocket upgrade
+        headers = getattr(request, 'headers', {})
+        
+        # Handle WebSocket upgrade
+        if headers.get('Upgrade') == 'websocket' or headers.get('upgrade') == 'websocket':
+            logger.info("WebSocket upgrade requested")
+            
+            try:
+                # Try to import and handle WISP protocol
+                from server import WispServer
+                import asyncio
+                
+                # Get WebSocket from request (Cloudflare provides this)
+                websocket = getattr(request, 'websocket', None)
+                
+                if websocket:
+                    logger.info("WebSocket object found, starting WISP server")
+                    server = WispServer()
+                    await server.handle_connection(websocket)
+                    logger.info("WebSocket connection closed")
+                    return None  # Connection handled
+                else:
+                    logger.warning("WebSocket upgrade requested but no websocket object available")
+                    return {
+                        "status": 400,
+                        "statusText": "Bad Request",
+                        "headers": {"Content-Type": "text/plain"},
+                        "body": "WebSocket not available\n"
+                    }
+            
+            except ImportError as e:
+                logger.error(f"Failed to import server: {e}")
+                return {
+                    "status": 500,
+                    "statusText": "Internal Server Error",
+                    "headers": {"Content-Type": "text/plain"},
+                    "body": f"Server error: {e}\n"
+                }
+            except Exception as e:
+                logger.error(f"WebSocket error: {e}")
+                return {
+                    "status": 500,
+                    "statusText": "Internal Server Error",
+                    "headers": {"Content-Type": "text/plain"},
+                    "body": f"WebSocket error: {e}\n"
+                }
+        
+        # Return status page for HTTP requests
+        status_text = (
+            "WISP 1.2 Server\n"
+            "Cloudflare Workers Python Implementation\n"
+            "=====================================\n"
+            "Connect via WebSocket to use the proxy.\n"
+            "URL: wss://your-domain.com/wisp/\n"
+            "\n"
+            "Status: Ready ✓\n"
+        )
+        
+        # Return response as dict (Cloudflare's built-in runtime will convert this)
+        return {
+            "status": 200,
+            "statusText": "OK",
+            "headers": {"Content-Type": "text/plain"},
+            "body": status_text
+        }
     
-    # Return status page for non-WebSocket requests
-    return Response(
-        "WISP 1.2 Server Ready\n"
-        "Cloudflare Workers Python Implementation\n"
-        "Connect via WebSocket to /wisp/ to use the proxy\n\n"
-        "GitHub: https://github.com/ading2210/wisp\n",
-        status=200,
-        headers={"Content-Type": "text/plain"}
-    )
+    except Exception as e:
+        logger.error(f"Error in handler: {e}", exc_info=True)
+        error_text = f"Error: {str(e)}\n"
+        
+        return {
+            "status": 500,
+            "statusText": "Internal Server Error",
+            "headers": {"Content-Type": "text/plain"},
+            "body": error_text
+        }
 
 
-# Export handler as default (Cloudflare Workers pattern)
-async def fetch(request: Request) -> Response:
-    """Standard fetch handler"""
-    return await on_request(request)
-
-
-# Support both patterns
-export = fetch
+# Support multiple entry point names
+fetch = handle
+on_request = handle
+main = handle

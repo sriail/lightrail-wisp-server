@@ -2,18 +2,33 @@ import asyncio
 from typing import Dict, Optional, Tuple
 import logging
 
-# Import fetch from the appropriate source
+logger = logging.getLogger(__name__)
+
+# Fetch is available as a built-in in Cloudflare Workers Python runtime
+# It should be in globals when we're running on Cloudflare
+fetch = None
+
+# Try to get fetch from different sources
 try:
-    from workers import fetch
-except ImportError:
-    # Fallback to built-in fetch (available in most JS runtimes)
-    try:
-        # This will work if we're running in a context with global fetch
+    # First try: check if it's already in globals
+    import builtins
+    if hasattr(builtins, 'fetch'):
+        fetch = builtins.fetch
+    else:
+        # Second try: check the current globals
         fetch = globals().get('fetch')
-        if fetch is None:
-            raise ImportError("fetch not available")
-    except:
-        raise ImportError("Cannot import fetch. Ensure you're running on Cloudflare Workers.")
+except:
+    pass
+
+# If still not found, provide a fallback
+if fetch is None:
+    logger.warning("Built-in fetch not available - HTTP requests will fail")
+    
+    async def fetch(*args, **kwargs):
+        raise RuntimeError(
+            "Fetch API not available. "
+            "Ensure you're running on Cloudflare Workers Python runtime."
+        )
 
 logger = logging.getLogger(__name__)
 

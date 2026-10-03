@@ -2,17 +2,16 @@ name = "lightrail-wisp-server"
 main = "src/worker.py"
 type = "python"
 compatibility_date = "2026-10-01"
-compatibility_flags = ["python_workers"]
+
 [python_modules]
 exclude = ["**/*.pyc", "**/__pycache__"]
 
 # Python Workers Configuration
 [env.production]
 vars = { ENVIRONMENT = "production", PYTHONUNBUFFERED = "1" }
-
-[[env.production.routes]]
-pattern = "your-domain.com/wisp/*"
-zone_name = "your-domain.com"
+routes = [
+  { pattern = "/wisp/*", zone_name = "your-domain.com" }
+]
 
 [env.development]
 vars = { ENVIRONMENT = "development", PYTHONUNBUFFERED = "1" }
@@ -23,11 +22,9 @@ routes = [
 # Python build settings
 [build]
 command = "pip install -r requirements.txt"
+disable_python_external_sdk = true
 
-# Enable Python external SDK (workers-py >= 1.9)
-python_external_sdk = false
-
-# Limits and performance
+# Limits and performance (For Pro Plan)
 # [limits]
 # cpu_ms = 30000
 
