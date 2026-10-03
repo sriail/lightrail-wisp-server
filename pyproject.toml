@@ -1,0 +1,12 @@
+[project]
+name = "lightrail-wisp-server"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "workers-runtime-sdk"
+]
+
+[dependency-groups]
+dev = [
+    "workers-py"
+]
