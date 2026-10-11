@@ -646,3 +646,9 @@ __all__ = [
     # Re-exported from cloudflare:sockets / cloudflare:fetch per spec checklist.
     "fetch",
 ]
+
+from workers import WorkerEntrypoint
+
+class Default(WorkerEntrypoint):
+    async def fetch(self, request):
+        return await on_fetch(request, self.env)
