@@ -15,7 +15,7 @@ import struct
 
 # Cloudflare Workers Python runtime imports.
 from workers import Response
-from js import WebSocketPair, URL, Uint8Array, fetch, connect
+from js import WebSocketPair, URL, Uint8Array, fetch
 
 # Outbound handlers (loaded lazily to keep startup cheap).
 import tcp as tcp_handler
@@ -644,6 +644,5 @@ __all__ = [
     "TCP_POOL_SIZE",
     "HTTP_POOL_SIZE",
     # Re-exported from cloudflare:sockets / cloudflare:fetch per spec checklist.
-    "connect",
     "fetch",
 ]
