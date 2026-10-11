@@ -2,7 +2,7 @@ name = "lightrail-wisp-server"
 main = "server.py"
 
 compatibility_date = "2026-04-20"
-compatibility_flags = ["python_workers"]
+compatibility_flags = ["python_workers", "disable_python_no_global_handlers"]
 [python_modules]
 exclude = ["**/*.pyc", "**/__pycache__"]
 
