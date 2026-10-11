@@ -15,10 +15,7 @@ import struct
 
 # Cloudflare Workers Python runtime imports.
 from workers import Response
-from js import WebSocketPair, URL, Uint8Array
-
-from js import connect  # noqa: F401  (re-exported below)
-from js import fetch       # noqa: F401  (re-exported below)
+from js import WebSocketPair, URL, Uint8Array, fetch, connect
 
 # Outbound handlers (loaded lazily to keep startup cheap).
 import tcp as tcp_handler
