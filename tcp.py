@@ -25,7 +25,8 @@ API restrictions (enforced by the spec):
 import asyncio
 import struct
 
-from js import connect
+from workers import import_from_javascript
+connect = import_from_javascript("cloudflare:sockets").connect
 
 try:
     from server import (
