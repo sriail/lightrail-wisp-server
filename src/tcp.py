@@ -27,8 +27,6 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Optional
 
-from workers import connect
-
 
 # ---------------------------------------------------------------------------
 # Close reason codes (mirrored from server.py to avoid an import cycle)
