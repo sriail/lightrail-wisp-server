@@ -1,19 +1,13 @@
-name = "lightrail-wisp-server"
-main = "server.py"
+name = "light-rail-wisp"
+main = "src/server.py"
+compatibility_date = "2024-10-01"
+compatibility_flags = ["python_workers"]
 
-compatibility_date = "2026-04-20"
-compatibility_flags = ["python_workers", "disable_python_no_global_handlers"]
-[python_modules]
-exclude = ["**/*.pyc", "**/__pycache__"]
-
-## Enables Logs and Traces (optional, you can disable)
-[observability.logs]
+[observability]
 enabled = true
-head_sampling_rate = 1
-invocation_logs = true
-persist = true
 
-[observability.traces]
+[env.production]
+name = "light-rail-wisp-prod"
+
+[env.production.observability]
 enabled = true
-head_sampling_rate = 1
-persist = true
