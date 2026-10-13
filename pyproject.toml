@@ -1,12 +1,38 @@
 [project]
-name = "wisp-python-worker"
-version = "0.1.0"
-description = "Small Wisp v1 TCP-over-WebSocket proxy for Cloudflare Python Workers"
-requires-python = ">=3.13"
+name = "light-rail-wisp"
+version = "1.2.0"
+description = "WISP 1.2 protocol server for Cloudflare Workers (Python)"
+requires-python = ">=3.12"
+authors = [
+    { name = "Sriail (Mac)" },
+]
+license = { text = "MIT" }
+keywords = ["wisp", "cloudflare-workers", "websocket", "proxy", "tcp", "http"]
+
+# Cloudflare Workers Python runtime: stdlib only. No third-party deps.
 dependencies = []
 
-[dependency-groups]
-dev = [
-  "workers-py",
-  "workers-runtime-sdk",
+[project.optional-dependencies]
+dev = []
+
+[tool.wrangler]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_ignores = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+]
+ignore = [
+    "E501",  # line-too-long (we keep code readable, not strictly 100c)
 ]
