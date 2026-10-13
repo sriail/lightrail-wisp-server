@@ -1,5 +1,5 @@
 [project]
-name = "light-rail-wisp"
+name = "lightrail-wisp-server"
 version = "1.2.0"
 description = "WISP 1.2 protocol server for Cloudflare Workers (Python)"
 requires-python = ">=3.12"
