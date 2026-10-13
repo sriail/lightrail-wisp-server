@@ -30,7 +30,8 @@ import asyncio
 import struct
 from typing import Any, Dict, Optional
 
-from workers import WorkerEntrypoint, Response, WebSocketPair, fetch
+from workers import WorkerEntrypoint, Response, fetch
+from js import WebSocketPair
 
 from tcp import TcpManager
 from http import HttpManager
