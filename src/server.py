@@ -33,8 +33,8 @@ from typing import Any, Dict, Optional
 from workers import WorkerEntrypoint, Response, fetch
 from js import WebSocketPair
 
-from tcp import TcpManager
-from http import HttpManager
+from tcp_manager import TcpManager
+from http_manager import HttpManager
 
 
 # ---------------------------------------------------------------------------
