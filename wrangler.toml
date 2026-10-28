@@ -11,7 +11,7 @@
 name = "wisp-workers-py"
 main = "worker.py"
 compatibility_date = "2026-08-01"
-compatibility_flags = ["python_workers"]
+compatibility_flags = ["python_workers", "disable_python_external_sdk"]
 
 # --- Optional tuning (all have safe defaults in worker.py) -------------------
 # [vars]
