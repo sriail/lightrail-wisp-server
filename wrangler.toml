@@ -1,13 +1,29 @@
-name = "lightrail-wisp-server"
-main = "src/server.py"
-compatibility_date = "2024-10-01"
+# wrangler.toml — deployment configuration for the Wisp v1 server
+# (Python Cloudflare Worker).
+#
+# Deploy:   npx wrangler deploy          (wrangler >= 4.x)
+# Local:    npx wrangler dev             (Python Workers run in workerd)
+#
+# Requires the `python_workers` compatibility flag; no Python package
+# dependencies are used (stdlib + runtime-provided `workers`/`js` modules
+# only), so no pyproject.toml dependency vendoring is required.
+
+name = "wisp-workers-py"
+main = "worker.py"
+compatibility_date = "2026-08-01"
 compatibility_flags = ["python_workers"]
 
+# --- Optional tuning (all have safe defaults in worker.py) -------------------
+# [vars]
+# WISP_LOG_LEVEL = "info"            # debug | info | warning | error
+# WISP_PASSWORD = "letmein"          # require /<password>/ in the wisp URL path
+# WISP_BUFFER_SIZE = "128"           # per-stream packet buffer (CONTINUE pacing)
+# WISP_CONNECT_TIMEOUT = "15"        # seconds; exceeding closes with 0x43
+# WISP_QUEUE_TIMEOUT = "30"          # seconds waiting for an outbound slot (0x49)
+# WISP_MAX_STREAMS = "64"            # per websocket session (0x49 beyond)
+# WISP_MAX_HTTP_BODY = "8388608"     # max buffered HTTP request body, bytes
+# WISP_HTTP_HEAD_PORTS = "80,443"    # destinations delegated to the fetch head
+# WISP_ALLOWED_HOST_REGEX = ".*"     # destination hostnames must match (0x48)
+
 [observability]
-enabled = true
-
-[env.production]
-name = "light-rail-wisp-prod"
-
-[env.production.observability]
 enabled = true
