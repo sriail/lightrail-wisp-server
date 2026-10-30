@@ -1,19 +1,9 @@
-# wrangler.toml — deployment configuration for the Wisp v1 server
-# (Python Cloudflare Worker).
-#
-# Deploy:   npx wrangler deploy          (wrangler >= 4.x)
-# Local:    npx wrangler dev             (Python Workers run in workerd)
-#
-# Requires the `python_workers` compatibility flag; no Python package
-# dependencies are used (stdlib + runtime-provided `workers`/`js` modules
-# only), so no pyproject.toml dependency vendoring is required.
-
 name = "wisp-workers-py"
 main = "worker.py"
 compatibility_date = "2026-08-01"
 compatibility_flags = ["python_workers", "disable_python_external_sdk"]
 
-# --- Optional tuning (all have safe defaults in worker.py) -------------------
+# Optional tuning (all have safe defaults in worker.py)
 # [vars]
 # WISP_LOG_LEVEL = "info"            # debug | info | warning | error
 # WISP_PASSWORD = "letmein"          # require /<password>/ in the wisp URL path
