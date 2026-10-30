@@ -1,1818 +1,1866 @@
+"""Wisp proxy server for Cloudflare Workers (Python).
+
+A single-file Wisp protocol server that runs on the Workers runtime via
+Pyodide.  It implements the task's *dual-head architecture*:
+
+  * **GET head**  - TCP streams destined for ports 80/443 are delegated to
+    HTTP requests issued through the Workers ``fetch()`` API.  The client's
+    plain-HTTP request is parsed off the Wisp stream, re-issued upstream and
+    the response is synthesised back onto the stream.  (TLS-shaped traffic
+    on 443 is detected and transparently falls back to the TCP head.)
+  * **CONNECT head** - every other TCP stream is relayed through the
+    ``connect()`` API from ``cloudflare:sockets`` (bridged by sockets.mjs).
+
+Concurrency is governed by two global (per-isolate) pools with a hard limit
+of 3 live TCP sockets and 3 in-flight GET/HTTP requests - six in-flight
+outbound requests in total.  Streams beyond a pool's limit wait in a bounded
+FIFO request queue with a timeout, exactly as required by the specification.
+
+Wire-format compatibility (auto-detected per connection):
+
+  * ``classic``  - the original MercuryWorkshop wisp v1 framing used by
+    Scramjet / epoxy-tls clients: CONNECT=0x00, DATA=0x01, CONTINUE=0x02,
+    CLOSE=0x03, big-endian integers, length-prefixed hostname, CONNECT
+    acknowledgment from the server.
+  * ``v1.2``     - the re-specified wisp-protocol v1.2 framing: CONNECT=0x01,
+    DATA=0x02, CONTINUE=0x03 (u32 buffer-remaining), CLOSE=0x04, little-
+    endian integers, hostname as rest-of-payload, server sends an initial
+    CONTINUE on stream 0, no CONNECT ack.
+  * ``v2``       - same framing as v1.2 plus the INFO handshake (selected
+    when the client offers a ``Sec-WebSocket-Protocol`` header or opens with
+    an INFO packet).  No extensions (and therefore no UDP) are advertised.
+
+Multi-threading and UDP/datagram support are intentionally stripped: the
+Workers runtime is single-threaded and exposes no UDP sockets.
+
+Secure WebSockets: the Worker accepts ``Upgrade: websocket`` on any path and
+always responds with a proper 101 (never a redirect), so it is fully usable
+through ``wss://`` on ``*.workers.dev`` and custom domains.  Clients running
+inside HTTPS pages/service workers MUST use ``wss://`` - browsers block
+``ws://`` from secure contexts (Mixed Content / SecurityError).
 """
-worker.py — Wisp v1 multiplexing proxy server for Cloudflare Workers (Python).
-
-A single-file port of wisp-server-python (MercuryWorkshop, AGPL-3.0) to the
-Cloudflare Workers Python runtime, implementing the Workers-revised Wisp v1
-specification (TCP-only, no UDP, no websocket forwarding).
-
-Architecture (dual-head outbound, strict 3+3 concurrency, queued):
-  * Client-facing heads (single `fetch()` entrypoint):
-      - WebSocket + path ending in "/"            -> Wisp v1 session  (spec)
-      - WebSocket + path ending in "/host:port"   -> legacy wsproxy tunnel
-      - Plain HTTP GET / or /index.html           -> landing page
-  * Outbound heads (the "dual head"):
-      - GET/HTTP head: streams destined to ports 80/443 whose payload parses as
-        HTTP/1.1 are delegated to `fetch()` subrequests (3 concurrent slots).
-      - live-TCP head: all other TCP traffic is tunneled over raw TCP sockets via
-        the `cloudflare:sockets` connect() API (3 concurrent slots).
-      - Transparent fallback: TLS records (0x16), HTTP `Upgrade:`/`CONNECT`
-        requests, or unparsable data on an HTTP-head stream are replayed into a
-        live-TCP tunnel so standard clients (epoxy/wisp) keep working.
-  * ConcurrencyGovernor: per-isolate singleton enforcing 3 live-TCP + 3 GET/HTTP
-    in-flight outbound requests (strict ceiling of 6) with a FIFO request queue.
-    Waiting past `WISP_QUEUE_TIMEOUT` rejects the stream with CLOSE 0x49.
-
-Everything runs on a single-threaded asyncio event loop: no threads, no
-processes, no UDP. See PLAN.MD for the reference-codebase analysis and
-REPORT.MD for validation results and deployment steps.
-"""
-
 from __future__ import annotations
 
 import asyncio
-import random
-import re
-import struct
+import json
 import time
-from dataclasses import dataclass, field
-from enum import IntEnum
-from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Sequence
-from urllib.parse import urlsplit
+import uuid
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 
-__version__ = "1.0.0"
+from js import Object, Promise, Response, WebSocketPair, console, fetch
+from pyodide.ffi import create_proxy, to_js
 
-# ---------------------------------------------------------------------------
-# Section 1: platform imports (guarded so the module also imports on CPython,
-# where the local test harness injects a fake platform and websocket socket).
-# ---------------------------------------------------------------------------
+try:  # sockets.mjs re-exports cloudflare:sockets for the Python side
+    from sockets import connect as _cf_connect
+except ImportError:  # pragma: no cover - TCP head disabled, GET head still works
+    _cf_connect = None  # type: ignore[assignment]
 
-try:  # pragma: no cover - only importable inside the Workers runtime
-    from js import Array as _JsArray
-    from js import Object as _JsObject
-    from js import WebSocketPair as _JsWebSocketPair
-    from js import fetch as _js_fetch
-    from pyodide.ffi import to_js as _to_js
-    from workers import Response as _WorkersResponse
-    from workers import WorkerEntrypoint as _WorkerEntrypoint
-    from workers import import_from_javascript as _import_from_javascript
-
-    WORKERS_RUNTIME: bool = True
-except ImportError:  # local development / conformance harness
-    WORKERS_RUNTIME = False
-    _WorkerEntrypoint = object  # type: ignore[assignment,misc]
-    _WorkersResponse = None  # type: ignore[assignment]
-
+try:  # new-style entrypoint (workers-runtime-sdk)
+    from workers import WorkerEntrypoint
+except ImportError:  # old-style module handlers (older compatibility dates)
+    WorkerEntrypoint = None  # type: ignore[assignment, misc]
 
 # ---------------------------------------------------------------------------
-# Section 2: constants, close reasons, configuration
+# Protocol constants
 # ---------------------------------------------------------------------------
 
 
-class PacketType(IntEnum):
+class _ClassicType:
+    """Packet types of the original MercuryWorkshop wisp v1 framing."""
+
+    CONNECT = 0x00
+    DATA = 0x01
+    CONTINUE = 0x02
+    CLOSE = 0x03
+
+
+class _V12Type:
+    """Packet types of the wisp-protocol v1.2 / v2 framing."""
+
     CONNECT = 0x01
     DATA = 0x02
     CONTINUE = 0x03
     CLOSE = 0x04
+    INFO = 0x05
 
 
-class StreamType(IntEnum):
-    TCP = 0x01
-    UDP = 0x02
+STREAM_TCP = 0x01
+STREAM_UDP = 0x02
 
+# Close reasons (wisp specification, "server only" set).
+REASON_UNSPECIFIED = 0x01
+REASON_VOLUNTARY = 0x02
+REASON_NETWORK_ERROR = 0x03
+REASON_INVALID_INFO = 0x41
+REASON_UNREACHABLE = 0x42
+REASON_CONNECT_TIMEOUT = 0x43
+REASON_REFUSED = 0x44
+REASON_TRANSFER_TIMEOUT = 0x47
+REASON_BLOCKED = 0x48
+REASON_THROTTLED = 0x49
 
-class CloseReason(IntEnum):
-    """Wisp close reasons (see WISP-SPEC.MD)."""
+# ---------------------------------------------------------------------------
+# Policy constants (strict task requirements + safety caps)
+# ---------------------------------------------------------------------------
 
-    UNSPECIFIED = 0x01
-    VOLUNTARY = 0x02
-    NETWORK_ERROR = 0x03
-    INVALID_INFO = 0x41
-    UNREACHABLE = 0x42
-    CONNECT_TIMEOUT = 0x43
-    REFUSED = 0x44
-    TRANSFER_TIMEOUT = 0x47
-    ADDRESS_BLOCKED = 0x48
-    THROTTLED = 0x49
+MAX_TCP_SLOTS = 3          # live TCP sockets via the CONNECT API (hard limit)
+MAX_HTTP_SLOTS = 3         # in-flight GET/HTTP requests (hard limit)
+GET_HEAD_PORTS = frozenset((80, 443))
 
+MAX_FRAME_BYTES = 1 << 20  # largest accepted wisp packet (1 MiB)
+MAX_DATA_FRAME = 65536     # largest DATA frame we send downstream
+MAX_HTTP_HEAD = 16 * 1024  # request head cap for the GET head
+MAX_HTTP_BODY = 10 << 20   # request body cap for the GET head
+INBOUND_QUEUE_LIMIT = 256  # buffered client DATA packets per stream
+SERVER_BUFFER_PACKETS = 64 # receive buffer announced to v1.2/v2 clients
+INITIAL_TX_PACKETS = 8     # optimistic send budget before first CONTINUE
+TX_PACKET_CAP = 512
+DEFAULT_FLOW_WINDOW_BYTES = 262144
 
-# Wire formats (all little-endian, per spec).
-HEADER_STRUCT = struct.Struct("<BI")          # packet_type: u8, stream_id: u32
-CONNECT_PAYLOAD_STRUCT = struct.Struct("<BH")  # stream_type: u8, dest_port: u16
-CONTINUE_PAYLOAD_STRUCT = struct.Struct("<I")  # buffer_remaining: u32
-CLOSE_PAYLOAD_STRUCT = struct.Struct("<B")     # reason: u8
+_HOP_BY_HOP_REQUEST = frozenset(
+    (
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "host",
+    )
+)
+_HOP_BY_HOP_RESPONSE = frozenset(
+    (
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    )
+)
 
-# Strict outbound concurrency: three live-TCP sockets + three GET/HTTP fetches
-# (== the platform's six-simultaneous-connection budget), FIFO-queued.
-TCP_SLOTS = 3
-HTTP_SLOTS = 3
-TOTAL_OUTBOUND_SLOTS = TCP_SLOTS + HTTP_SLOTS
+_HTTP_METHODS = frozenset(
+    {"GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "TRACE"}
+)
 
-DEFAULT_BUFFER_SIZE = 128        # per-stream inbound FIFO (packets), as reference
-CONTINUE_INTERVAL = 32           # queue_size // 4, as reference
-DEFAULT_CONNECT_TIMEOUT = 15.0   # seconds; exceeding => CLOSE 0x43
-DEFAULT_QUEUE_TIMEOUT = 30.0     # seconds waiting for a slot => CLOSE 0x49
-DEFAULT_MAX_HTTP_BODY = 8 * 1024 * 1024
-DEFAULT_MAX_STREAMS = 64         # per session; exceeding => CLOSE 0x49
-HTTP_HEADER_LIMIT = 65536        # request head size cap for the GET/HTTP head
-WS_SESSION_QUEUE_LIMIT = 1024    # inbound ws frames buffered per session
-DEFAULT_HTTP_HEAD_PORTS = frozenset({80, 443})
-
-REASON_PHRASES: dict[int, str] = {
+REASON_PHRASES: Dict[int, str] = {
     100: "Continue", 101: "Switching Protocols", 200: "OK", 201: "Created",
-    202: "Accepted", 204: "No Content", 206: "Partial Content", 301: "Moved Permanently",
-    302: "Found", 303: "See Other", 304: "Not Modified", 307: "Temporary Redirect",
-    308: "Permanent Redirect", 400: "Bad Request", 401: "Unauthorized",
-    403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed",
-    408: "Request Timeout", 409: "Conflict", 410: "Gone", 413: "Payload Too Large",
-    418: "I'm a teapot", 426: "Upgrade Required", 429: "Too Many Requests",
-    500: "Internal Server Error", 501: "Not Implemented", 502: "Bad Gateway",
-    503: "Service Unavailable", 504: "Gateway Timeout",
+    202: "Accepted", 203: "Non-Authoritative Information", 204: "No Content",
+    205: "Reset Content", 206: "Partial Content", 300: "Multiple Choices",
+    301: "Moved Permanently", 302: "Found", 303: "See Other", 304: "Not Modified",
+    307: "Temporary Redirect", 308: "Permanent Redirect", 400: "Bad Request",
+    401: "Unauthorized", 402: "Payment Required", 403: "Forbidden",
+    404: "Not Found", 405: "Method Not Allowed", 406: "Not Acceptable",
+    407: "Proxy Authentication Required", 408: "Request Timeout", 409: "Conflict",
+    410: "Gone", 411: "Length Required", 412: "Precondition Failed",
+    413: "Payload Too Large", 414: "URI Too Long", 415: "Unsupported Media Type",
+    416: "Range Not Satisfiable", 417: "Expectation Failed",
+    421: "Misdirected Request", 422: "Unprocessable Entity", 426: "Upgrade Required",
+    429: "Too Many Requests", 431: "Request Header Fields Too Large",
+    451: "Unavailable For Legal Reasons", 500: "Internal Server Error",
+    501: "Not Implemented", 502: "Bad Gateway", 503: "Service Unavailable",
+    504: "Gateway Timeout", 505: "HTTP Version Not Supported",
 }
 
-# Hop-by-hop headers never forwarded in either direction (RFC 9110 + proxies).
-HOP_BY_HOP_HEADERS = frozenset({
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
-})
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
 
 
-def _env_get(env: Any, name: str, default: Optional[str]) -> Optional[str]:
-    """Read a setting from a Workers env binding or a plain dict (tests)."""
+class WispProtocolError(Exception):
+    """Malformed framing; the connection must be closed with 1002."""
+
+
+class InvalidConnectPayload(Exception):
+    """Malformed CONNECT payload; the stream must be closed with 0x41."""
+
+
+class PoolQueueFullError(Exception):
+    """The per-pool request queue is at its limit."""
+
+
+class PoolAcquireTimeoutError(Exception):
+    """A queued request waited longer than the configured timeout."""
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+
+def _env_get(env: Any, name: str) -> Optional[str]:
     if env is None:
-        return default
-    if isinstance(env, dict):
-        value = env.get(name)
-    else:
+        return None
+    value: Any = None
+    try:
+        value = getattr(env, name, None)
+    except Exception:  # noqa: BLE001 - JsProxy attribute access is best-effort
+        value = None
+    if value is None:
         try:
-            value = getattr(env, name, None)
-        except Exception:
+            value = env[name]
+        except Exception:  # noqa: BLE001
             value = None
-    if value is None or value == "":
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        return str(value)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _env_int(env: Any, name: str, default: int, lo: int, hi: int) -> int:
+    raw = _env_get(env, name)
+    if raw is None or raw == "":
         return default
-    return str(value)
+    try:
+        value = int(raw.strip())
+    except (TypeError, ValueError):
+        console.warn(f"[wisp] invalid env {name}={raw!r}; using default {default}")
+        return default
+    if value < lo or value > hi:
+        console.warn(f"[wisp] env {name}={value} out of range [{lo},{hi}]; using default {default}")
+        return default
+    return value
 
 
-@dataclass
-class ServerConfig:
-    """Runtime configuration, sourced from env vars in production."""
+def _env_bool(env: Any, name: str, default: bool) -> bool:
+    raw = _env_get(env, name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
-    buffer_size: int = DEFAULT_BUFFER_SIZE
-    connect_timeout: float = DEFAULT_CONNECT_TIMEOUT
-    queue_timeout: float = DEFAULT_QUEUE_TIMEOUT
-    max_http_body: int = DEFAULT_MAX_HTTP_BODY
-    max_streams: int = DEFAULT_MAX_STREAMS
-    http_head_ports: frozenset[int] = DEFAULT_HTTP_HEAD_PORTS
-    https_ports: frozenset[int] = frozenset({443})
-    password: Optional[str] = None
-    allowed_host_regex: Optional[re.Pattern[str]] = None
+
+@dataclass(frozen=True)
+class WispConfig:
+    """Runtime configuration (all values have safe defaults)."""
+
     log_level: str = "info"
+    queue_limit: int = 64
+    queue_timeout_ms: int = 15000
+    connect_timeout_ms: int = 10000
+    http_head_timeout_ms: int = 10000
+    flow_window_bytes: int = DEFAULT_FLOW_WINDOW_BYTES
+    continue_stall_ms: int = 30000
+    greet_grace_ms: int = 250
+    allow_tcp_fallback: bool = True
+    classic_connect_ack: bool = True
 
     @classmethod
-    def from_env(cls, env: Any) -> "ServerConfig":
-        def ival(name: str, default: int) -> int:
-            raw = _env_get(env, name, None)
-            try:
-                return int(raw) if raw is not None else default
-            except ValueError:
-                LOG.warning("config invalid int for %s=%r, using default", name, raw)
-                return default
-
-        def fval(name: str, default: float) -> float:
-            raw = _env_get(env, name, None)
-            try:
-                return float(raw) if raw is not None else default
-            except ValueError:
-                LOG.warning("config invalid float for %s=%r, using default", name, raw)
-                return default
-
-        def portset(name: str, default: frozenset[int]) -> frozenset[int]:
-            raw = _env_get(env, name, None)
-            if not raw:
-                return default
-            try:
-                return frozenset(int(p.strip()) for p in raw.split(",") if p.strip())
-            except ValueError:
-                LOG.warning("config invalid %s=%r, using default", name, raw)
-                return default
-
-        ports: frozenset[int] = portset("WISP_HTTP_HEAD_PORTS", DEFAULT_HTTP_HEAD_PORTS)
-
-        host_re_raw = _env_get(env, "WISP_ALLOWED_HOST_REGEX", None)
-        host_re: Optional[re.Pattern[str]] = None
-        if host_re_raw:
-            try:
-                host_re = re.compile(host_re_raw)
-            except re.error:
-                LOG.warning("config invalid WISP_ALLOWED_HOST_REGEX, ignoring")
-
+    def from_env(cls, env: Any) -> "WispConfig":
+        level = (_env_get(env, "WISP_LOG_LEVEL") or "info").strip().lower()
+        if level not in ("debug", "info", "warn", "error"):
+            level = "info"
         return cls(
-            buffer_size=max(1, ival("WISP_BUFFER_SIZE", DEFAULT_BUFFER_SIZE)),
-            connect_timeout=fval("WISP_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT),
-            queue_timeout=fval("WISP_QUEUE_TIMEOUT", DEFAULT_QUEUE_TIMEOUT),
-            max_http_body=max(1024, ival("WISP_MAX_HTTP_BODY", DEFAULT_MAX_HTTP_BODY)),
-            max_streams=max(1, ival("WISP_MAX_STREAMS", DEFAULT_MAX_STREAMS)),
-            http_head_ports=ports,
-            https_ports=portset("WISP_HTTPS_PORTS", frozenset({443})),
-            password=_env_get(env, "WISP_PASSWORD", None),
-            allowed_host_regex=host_re,
-            log_level=(_env_get(env, "WISP_LOG_LEVEL", "info") or "info").lower(),
+            log_level=level,
+            queue_limit=_env_int(env, "WISP_QUEUE_LIMIT", 64, 0, 4096),
+            queue_timeout_ms=_env_int(env, "WISP_QUEUE_TIMEOUT_MS", 15000, 100, 600000),
+            connect_timeout_ms=_env_int(env, "WISP_CONNECT_TIMEOUT_MS", 10000, 100, 600000),
+            http_head_timeout_ms=_env_int(env, "WISP_HTTP_HEAD_TIMEOUT_MS", 10000, 100, 600000),
+            flow_window_bytes=_env_int(
+                env, "WISP_FLOW_WINDOW_BYTES", DEFAULT_FLOW_WINDOW_BYTES, 4096, 1 << 24
+            ),
+            continue_stall_ms=_env_int(env, "WISP_CONTINUE_STALL_MS", 30000, 500, 600000),
+            greet_grace_ms=_env_int(env, "WISP_GREET_GRACE_MS", 250, 0, 5000),
+            allow_tcp_fallback=_env_bool(env, "WISP_ALLOW_TCP_FALLBACK", True),
+            classic_connect_ack=_env_bool(env, "WISP_CLASSIC_CONNECT_ACK", True),
         )
 
+    @property
+    def queue_timeout_s(self) -> float:
+        return self.queue_timeout_ms / 1000.0
+
+    @property
+    def connect_timeout_s(self) -> float:
+        return self.connect_timeout_ms / 1000.0
+
+    @property
+    def http_head_timeout_s(self) -> float:
+        return self.http_head_timeout_ms / 1000.0
+
+    @property
+    def continue_stall_s(self) -> float:
+        return self.continue_stall_ms / 1000.0
+
 
 # ---------------------------------------------------------------------------
-# Section 3: logging (print-based; workerd forwards console output)
+# Logging (structured JSON lines)
 # ---------------------------------------------------------------------------
 
-
-class LogLevel(IntEnum):
-    DEBUG = 10
-    INFO = 20
-    WARNING = 30
-    ERROR = 40
-
-
-_LEVEL_NAMES = {10: "DEBUG", 20: "INFO", 30: "WARN", 40: "ERROR"}
+_LEVELS: Dict[str, int] = {"debug": 10, "info": 20, "warn": 30, "error": 40}
 
 
 class Logger:
-    """Minimal level-gated, printf-style logger.
+    """Minimal structured logger writing single-line JSON to the console."""
 
-    Uses print() so output reaches the Workers console from pyodide. Callers
-    embed their component tag (e.g. ``[stream 3]``) directly in the message:
-    ``LOG.info("[%s] started", label)``.
-    """
+    def __init__(self, level: str = "info", sink: Any = console, fields: Optional[Dict[str, Any]] = None) -> None:
+        self._level = _LEVELS.get(level, 20)
+        self._sink = sink
+        self._fields: Dict[str, Any] = dict(fields or {})
 
-    def __init__(self, level: int = LogLevel.INFO) -> None:
-        self.level = level
+    def bind(self, **fields: Any) -> "Logger":
+        merged = dict(self._fields)
+        merged.update(fields)
+        return Logger(level=self._name_of(self._level), sink=self._sink, fields=merged)
 
-    def set_level(self, name: str) -> None:
-        try:
-            self.level = LogLevel[str.strip(name or "info").upper()]
-        except KeyError:
-            self.level = LogLevel.INFO
+    @staticmethod
+    def _name_of(level: int) -> str:
+        for name, value in _LEVELS.items():
+            if value == level:
+                return name
+        return "info"
 
-    def _emit(self, level: int, message: str) -> None:
-        if level < self.level:
+    def _emit(self, name: str, level: int, event: str, fields: Dict[str, Any]) -> None:
+        if level < self._level:
             return
-        stamp = time.strftime("%Y/%m/%d %H:%M:%S", time.gmtime())
-        print(f"[{stamp}] [{_LEVEL_NAMES.get(level, 'LOG')}] [wisp] {message}", flush=True)
+        record: Dict[str, Any] = {"ts": round(time.time(), 3), "level": name, "event": event}
+        record.update(self._fields)
+        record.update(fields)
+        try:
+            self._sink.log(json.dumps(record, separators=(",", ":"), default=str))
+        except Exception:  # noqa: BLE001 - logging must never crash the worker
+            pass
 
-    def debug(self, fmt: str, *args: Any) -> None:
-        self._emit(LogLevel.DEBUG, fmt % args if args else fmt)
+    def debug(self, event: str, **fields: Any) -> None:
+        self._emit("debug", 10, event, fields)
 
-    def info(self, fmt: str, *args: Any) -> None:
-        self._emit(LogLevel.INFO, fmt % args if args else fmt)
+    def info(self, event: str, **fields: Any) -> None:
+        self._emit("info", 20, event, fields)
 
-    def warning(self, fmt: str, *args: Any) -> None:
-        self._emit(LogLevel.WARNING, fmt % args if args else fmt)
+    def warn(self, event: str, **fields: Any) -> None:
+        self._emit("warn", 30, event, fields)
 
-    def error(self, fmt: str, *args: Any) -> None:
-        self._emit(LogLevel.ERROR, fmt % args if args else fmt)
-
-
-LOG = Logger()
-
-
-def configure_logging(level_name: str) -> None:
-    LOG.set_level(level_name)
+    def error(self, event: str, **fields: Any) -> None:
+        self._emit("error", 40, event, fields)
 
 
 # ---------------------------------------------------------------------------
-# Section 4: protocol codec (pure functions; no I/O)
+# Wire formats and packet codec
 # ---------------------------------------------------------------------------
 
 
-class ProtocolError(Exception):
-    """Base class for wisp protocol violations."""
+class WireFormat(Enum):
+    CLASSIC = "classic"
+    V12 = "v1.2"
+    V2 = "v2"
 
 
-class InvalidConnectPayload(ProtocolError):
-    """CONNECT payload is malformed -> CLOSE 0x41."""
-
-
-class UdpUnsupported(ProtocolError):
-    """UDP streams are not supported on Workers -> CLOSE 0x48."""
+@dataclass(frozen=True)
+class WispPacket:
+    ptype: int
+    stream_id: int
+    payload: bytes
 
 
 @dataclass(frozen=True)
 class ConnectRequest:
-    stream_type: int
+    protocol: int
     port: int
     hostname: str
 
-    @property
-    def dest(self) -> str:
-        return f"{self.hostname}:{self.port}"
+
+def _encode_packet(wire: WireFormat, ptype: int, stream_id: int, payload: bytes = b"") -> bytes:
+    if wire is WireFormat.CLASSIC:
+        sid_bytes = stream_id.to_bytes(4, "big")
+    else:
+        sid_bytes = stream_id.to_bytes(4, "little")
+    return bytes((ptype,)) + sid_bytes + payload
 
 
-def parse_connect_payload(payload: bytes) -> ConnectRequest:
-    """Validate and decode a CONNECT payload (stream_type, port, hostname)."""
-    if len(payload) < 4:
-        raise InvalidConnectPayload("CONNECT payload too short")
-    stream_type, port = CONNECT_PAYLOAD_STRUCT.unpack_from(payload, 0)
-    if stream_type not in (int(StreamType.TCP), int(StreamType.UDP)):
-        raise InvalidConnectPayload(f"invalid stream type 0x{stream_type:02x}")
-    if stream_type == int(StreamType.UDP):
-        # Workers-revised spec: UDP is intentionally blocked on the server.
-        raise UdpUnsupported("UDP streams are not supported on this server")
+def _parse_packet(wire: WireFormat, buf: bytes) -> WispPacket:
+    if len(buf) < 5:
+        raise WispProtocolError("packet shorter than the 5-byte header")
+    if wire is WireFormat.CLASSIC:
+        stream_id = int.from_bytes(buf[1:5], "big")
+    else:
+        stream_id = int.from_bytes(buf[1:5], "little")
+    return WispPacket(ptype=buf[0], stream_id=stream_id, payload=buf[5:])
+
+
+def _parse_connect(wire: WireFormat, payload: bytes) -> ConnectRequest:
+    if wire is WireFormat.CLASSIC:
+        if len(payload) < 4:
+            raise InvalidConnectPayload("classic CONNECT payload truncated")
+        protocol = payload[0]
+        port = int.from_bytes(payload[1:3], "big")
+        host_len = payload[3]
+        if len(payload) < 4 + host_len:
+            raise InvalidConnectPayload("classic hostname overruns payload")
+        if len(payload) != 4 + host_len:
+            raise InvalidConnectPayload("trailing bytes after classic hostname")
+        host_bytes = payload[4 : 4 + host_len]
+    else:
+        if len(payload) < 3:
+            raise InvalidConnectPayload("v1.2 CONNECT payload truncated")
+        protocol = payload[0]
+        port = int.from_bytes(payload[1:3], "little")
+        host_bytes = payload[3:]
+    if protocol not in (STREAM_TCP, STREAM_UDP):
+        raise InvalidConnectPayload(f"unknown stream type 0x{protocol:02x}")
+    if not 1 <= port <= 65535:
+        raise InvalidConnectPayload(f"invalid port {port}")
+    if not 1 <= len(host_bytes) <= 255:
+        raise InvalidConnectPayload(f"invalid hostname length {len(host_bytes)}")
     try:
-        hostname = payload[3:].decode("utf-8")
+        hostname = host_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise InvalidConnectPayload("hostname is not valid UTF-8") from exc
-    if not 1 <= port <= 65535:
-        raise InvalidConnectPayload(f"invalid destination port {port}")
-    if not hostname or len(hostname) > 255:
-        raise InvalidConnectPayload("invalid hostname length")
-    if any(ord(ch) < 0x21 or ord(ch) == 0x7F for ch in hostname):
+    if any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in hostname):
         raise InvalidConnectPayload("hostname contains control characters")
-    return ConnectRequest(stream_type=stream_type, port=port, hostname=hostname)
+    return ConnectRequest(protocol=protocol, port=port, hostname=hostname)
 
 
-def build_frame(packet_type: int, stream_id: int, payload: bytes) -> bytes:
-    return HEADER_STRUCT.pack(packet_type, stream_id) + payload
-
-
-def data_frame(stream_id: int, payload: bytes) -> bytes:
-    return build_frame(int(PacketType.DATA), stream_id, payload)
-
-
-def continue_frame(stream_id: int, buffer_remaining: int) -> bytes:
-    return build_frame(
-        int(PacketType.CONTINUE), stream_id, CONTINUE_PAYLOAD_STRUCT.pack(buffer_remaining)
-    )
-
-
-def close_frame(stream_id: int, reason: int) -> bytes:
-    return build_frame(int(PacketType.CLOSE), stream_id, CLOSE_PAYLOAD_STRUCT.pack(reason))
+def _parse_continue_credit(wire: WireFormat, payload: bytes) -> Optional[int]:
+    """Return the announced buffer-remaining (v1.2/v2) or None (classic)."""
+    if wire is WireFormat.CLASSIC:
+        return None
+    if len(payload) < 4:
+        return 1
+    return int.from_bytes(payload[:4], "little")
 
 
 # ---------------------------------------------------------------------------
-# Section 5: concurrency governor — strict 3+3 slots, FIFO request queue
+# JS interop helpers
 # ---------------------------------------------------------------------------
 
 
-class SlotTimeoutError(Exception):
-    """A slot could not be acquired within the queue timeout (=> 0x49)."""
+async def _await_js(promise: Any) -> Any:
+    """Await a JS Promise (JsProxy) - wrapped so asyncio.wait_for can cancel."""
+    return await promise
 
 
-class Lease:
-    """A held concurrency slot. Idempotent release; never leaks past close()."""
-
-    __slots__ = ("_pool", "_released")
-
-    def __init__(self, pool: "SlotPool") -> None:
-        self._pool = pool
-        self._released = False
-
-    def release(self) -> None:
-        if not self._released:
-            self._released = True
-            self._pool._release_slot()
-
-
-class SlotPool:
-    """A fixed-size slot pool with strict FIFO waiters (the request queue)."""
-
-    def __init__(self, name: str, size: int) -> None:
-        self.name = name
-        self._size = size
-        self._used = 0
-        self._waiters: "asyncio.Queue[asyncio.Future[None]]" = asyncio.Queue()
-
-    @property
-    def in_flight(self) -> int:
-        return self._used
-
-    @property
-    def waiting(self) -> int:
-        return self._waiters.qsize()
-
-    def stats(self) -> str:
-        return f"{self.name}={self._used}/{self._size} queued={self.waiting}"
-
-    async def acquire(self, timeout: float) -> Lease:
-        loop = asyncio.get_running_loop()
-        if self._used < self._size and self._waiters.empty():
-            self._used += 1
-            LOG.debug("[governor] acquire %s -> immediate (%s)", self.name, self.stats())
-            return Lease(self)
-        fut: "asyncio.Future[None]" = loop.create_future()
-        await self._waiters.put(fut)
-        LOG.debug("[governor] queueing for %s slot (%s)", self.name, self.stats())
+def _ws_payload_to_bytes(data: Any) -> bytes:
+    if isinstance(data, bytes):
+        return data
+    if isinstance(data, bytearray):
+        return bytes(data)
+    if isinstance(data, memoryview):
+        return data.tobytes()
+    if isinstance(data, str):
+        return data.encode("utf-8")
+    to_bytes = getattr(data, "to_bytes", None)
+    if callable(to_bytes):
         try:
-            await asyncio.wait_for(fut, timeout)
-        except asyncio.TimeoutError:
-            LOG.warning(
-                "[governor] timeout waiting %.1fs for %s slot (%s)",
-                timeout, self.name, self.stats(),
-            )
-            raise SlotTimeoutError(
-                f"timed out waiting for a {self.name} outbound slot"
-            ) from None
-        return Lease(self)
-
-    def _release_slot(self) -> None:
-        self._used -= 1
-        if self._used < 0:  # defensive: never allow negative accounting
-            self._used = 0
-        while not self._waiters.empty():
-            fut = self._waiters.get_nowait()
-            if not fut.done():
-                self._used += 1
-                fut.set_result(None)
-                LOG.debug("[governor] handed %s slot to next waiter (%s)",
-                          self.name, self.stats())
-                break
-
-
-class ConcurrencyGovernor:
-    """Per-isolate governor: 3 live-TCP + 3 GET/HTTP in-flight (strict 6)."""
-
-    def __init__(
-        self,
-        tcp_slots: int = TCP_SLOTS,
-        http_slots: int = HTTP_SLOTS,
-    ) -> None:
-        self.tcp = SlotPool("live-tcp", tcp_slots)
-        self.http = SlotPool("get-http", http_slots)
-
-    def stats(self) -> str:
-        return f"{self.tcp.stats()} | {self.http.stats()}"
-
-
-_GOVERNOR: Optional[ConcurrencyGovernor] = None
-
-
-def get_governor() -> ConcurrencyGovernor:
-    """Module-level singleton: the 6-slot ceiling is enforced per isolate."""
-    global _GOVERNOR
-    if _GOVERNOR is None:
-        _GOVERNOR = ConcurrencyGovernor()
-        LOG.info("[governor] initialized: %d live-tcp + %d get-http slots (strict)",
-                 TCP_SLOTS, HTTP_SLOTS)
-    return _GOVERNOR
-
-
-# ---------------------------------------------------------------------------
-# Section 6: outbound transport abstractions + the two heads
-# ---------------------------------------------------------------------------
-
-
-class OutboundConnectError(Exception):
-    """Outbound connection setup failed; carries the wisp CLOSE reason."""
-
-    def __init__(self, reason: CloseReason, detail: str) -> None:
-        super().__init__(detail)
-        self.reason = reason
-        self.detail = detail
-
-
-def classify_connect_failure(exc: BaseException) -> CloseReason:
-    """Map a platform connect error onto a spec close reason."""
-    text = f"{type(exc).__name__}: {exc}".lower()
-    if "econnrefused" in text or "refused" in text:
-        return CloseReason.REFUSED
-    if "etimedout" in text or "timed out" in text or "timeout" in text:
-        return CloseReason.CONNECT_TIMEOUT
-    if (
-        "enotfound" in text
-        or "eai_again" in text
-        or "getaddrinfo" in text
-        or "resolve" in text
-        or "dns" in text
-    ):
-        return CloseReason.UNREACHABLE
-    if "eblocked" in text or "not allowed" in text or "blocked" in text:
-        return CloseReason.ADDRESS_BLOCKED
-    return CloseReason.UNREACHABLE
-
-
-# Structural interfaces a platform must provide (implemented by
-# CloudflarePlatform in production and by the local harness in tests):
-#   tcp_connect(host, port, timeout) -> TcpConnection
-#       TcpConnection: async read() -> bytes|None (None = EOF),
-#                      async write(bytes), close()
-#   http_fetch(method, url, headers, body, timeout) -> FetchResponse
-#       FetchResponse: status:int, status_text:str,
-#                      headers:list[tuple[str,str]],
-#                      body_chunks() -> async iterator of bytes
-
-
-def _looks_like_http_start(data: bytes) -> bool:
-    """Heuristic: first bytes look like an HTTP/1.1 request (method start)."""
-    if not data:
-        return False
-    first = data[0]
-    return 0x41 <= first <= 0x5A  # 'A'..'Z' — every HTTP method starts uppercase
-
-
-def _looks_like_tls_start(data: bytes) -> bool:
-    """Heuristic: first bytes look like a TLS record (ClientHello)."""
-    return len(data) >= 1 and data[0] == 0x16
-
-
-class TcpHead:
-    """Live-TCP head: raw bidirectional tunnel via cloudflare:sockets."""
-
-    kind = "live-tcp"
-
-    def __init__(self, stream: "Stream") -> None:
-        self.stream = stream
-        self._conn: Any = None
-        self._lease: Optional[Lease] = None
-        self._reader_task: Optional["asyncio.Task[None]"] = None
-        self.closed = False
-
-    async def start(self, initial: bytes) -> None:
-        cfg = self.stream.config
-        gov = get_governor()
-        lease = await gov.tcp.acquire(cfg.queue_timeout)  # may raise SlotTimeoutError
-        self._lease = lease
-        try:
-            self._conn = await self.stream.platform.tcp_connect(
-                self.stream.host, self.stream.port, cfg.connect_timeout
-            )
-        except BaseException:
-            lease.release()
-            self._lease = None
-            raise
-        self._reader_task = asyncio.ensure_future(self._reader_loop())
-        if initial:
-            await self._conn.write(initial)
-
-    async def _reader_loop(self) -> None:
-        stream = self.stream
-        sid = stream.stream_id
-        try:
-            while True:
-                data = await self._conn.read()
-                if not data:  # graceful EOF from the destination
-                    break
-                await stream.send_to_client(data)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # network error mid-transfer
-            LOG.warning("[stream %d] tcp read failed: %s", sid, exc)
-            await stream.end_stream(CloseReason.NETWORK_ERROR, notify=True)
-            return
-        await stream.end_stream(CloseReason.VOLUNTARY, notify=True)
-
-    async def on_data(self, data: bytes) -> None:
-        if self._conn is None or self.closed:
-            return
-        await self._conn.write(data)
-
-    async def close(self) -> None:
-        if self.closed:
-            return
-        self.closed = True
-        await _cancel_task(self._reader_task)
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            except Exception as exc:
-                LOG.debug("[stream %d] tcp close error: %s", self.stream.stream_id, exc)
-        if self._lease is not None:
-            self._lease.release()
-            self._lease = None
-
-
-@dataclass
-class HttpRequest:
-    """A fully-buffered HTTP/1. request parsed off a wisp stream."""
-
-    method: str
-    target: str
-    version: str
-    headers: list[tuple[str, str]]
-    body: Optional[bytes]
-    connection_close: bool
-
-
-class _TcpFallback(Exception):
-    """Internal signal: replay buffered bytes into a live-TCP tunnel."""
-
-    def __init__(self, why: str) -> None:
-        super().__init__(why)
-        self.why = why
-
-
-class HttpFetchHead:
-    """GET/HTTP head: relays HTTP/1.1 on the stream through `fetch()`.
-
-    Parses requests from the stream, issues them as fetch subrequests (one
-    HTTP slot per in-flight request), and serializes responses back with
-    chunked (or absent) framing. Falls back to a live-TCP tunnel — replaying
-    every byte received so far — when the payload turns out to be a TLS
-    record, an HTTP Upgrade/CONNECT, or unparsable, as long as no response
-    bytes have been emitted yet.
-    """
-
-    kind = "get-http"
-
-    def __init__(self, stream: "Stream") -> None:
-        self.stream = stream
-        self.scheme = (
-            "https" if stream.port in stream.config.https_ports else "http"
-        )
-        self.buf = bytearray()
-        self.pos = 0  # parse offset; bytes before it are committed on fallback
-        self._data_evt = asyncio.Event()
-        self.closed = False
-        self._responses_sent = 0
-        self._task: "asyncio.Task[None]" = asyncio.ensure_future(self._run())
-
-    # -- buffer helpers ----------------------------------------------------
-
-    def _available(self) -> int:
-        return len(self.buf) - self.pos
-
-    async def _wait_for_data(self, needed: int) -> bool:
-        """Await until `needed` bytes are available; False if closed."""
-        while self._available() < needed:
-            if self.closed:
-                return False
-            self._data_evt.clear()
-            if self._available() >= needed:
-                return True
-            await self._data_evt.wait()
-        return True
-
-    async def _read_until(self, delimiter: bytes, cap: int) -> Optional[bytes]:
-        """Read up to (and including) `delimiter`; None when closed/over cap."""
-        while True:
-            idx = self.buf.find(delimiter, self.pos)
-            if idx != -1:
-                end = idx + len(delimiter)
-                out = bytes(self.buf[self.pos:end])
-                self.pos = end
-                return out
-            if self.closed:
-                return None  # client is gone; partial requests are dropped
-            if self._available() > cap:
-                raise _TcpFallback("http head exceeds size cap")
-            await self._wait_for_data(self._available() + 1)
-
-    async def _read_exact(self, n: int) -> Optional[bytes]:
-        if not await self._wait_for_data(n):
-            return None
-        out = bytes(self.buf[self.pos:self.pos + n])
-        self.pos += n
-        return out
-
-    # -- request parsing ----------------------------------------------------
-
-    async def _read_request(self) -> Optional[HttpRequest]:
-        """Parse one request; raises _TcpFallback when tunneled traffic is
-        detected; returns None when the stream closed cleanly."""
-        head = await self._read_until(b"\r\n\r\n", HTTP_HEADER_LIMIT)
-        if head is None:
-            return None
-        try:
-            text = head.decode("latin-1")
-        except UnicodeDecodeError:
-            raise _TcpFallback("undecodable request head") from None
-        lines = text.split("\r\n")
-        m = re.match(r"^([A-Za-z!#$%&'*+.^_`|~0-9-]+) (\S+) (HTTP/\d\.\d)$", lines[0])
-        if m is None:
-            raise _TcpFallback(f"malformed request line: {lines[0][:64]!r}")
-        method, target, version = m.group(1).upper(), m.group(2), m.group(3)
-
-        headers: list[tuple[str, str]] = []
-        for line in lines[1:]:
-            if not line:
-                continue
-            if line[0] in " \t":
-                raise _TcpFallback("obsolete header folding not supported")
-            name, sep, value = line.partition(":")
-            if not sep or not name.strip():
-                raise _TcpFallback(f"malformed header line: {line[:64]!r}")
-            headers.append((name.strip().lower(), value.strip()))
-
-        header_map: dict[str, str] = {}
-        for name, value in headers:
-            header_map[name] = value  # last value wins for lookup purposes
-
-        if method == "CONNECT":
-            raise _TcpFallback("CONNECT method must be tunneled")
-        if "upgrade" in header_map:
-            raise _TcpFallback(f"upgrade to {header_map['upgrade']!r} must be tunneled")
-
-        connection_tokens = {
-            tok.strip().lower()
-            for tok in header_map.get("connection", "").split(",")
-            if tok.strip()
-        }
-        connection_close = "close" in connection_tokens
-
-        body: Optional[bytes] = None
-        if "content-length" in header_map:
-            try:
-                clen = int(header_map["content-length"])
-            except ValueError:
-                raise _TcpFallback("invalid content-length") from None
-            if clen < 0 or clen > self.stream.config.max_http_body:
-                raise _TcpFallback(f"content-length {clen} out of bounds")
-            if clen > 0:
-                body = await self._read_exact(clen)
-                if body is None:
-                    return None
-        elif header_map.get("transfer-encoding", "").lower() == "chunked":
-            body = await self._read_chunked_body()
-            if body is None:
-                return None
-        return HttpRequest(
-            method=method, target=target, version=version,
-            headers=headers, body=body, connection_close=connection_close,
-        )
-
-    async def _read_chunked_body(self) -> Optional[bytes]:
-        chunks: list[bytes] = []
-        total = 0
-        cap = self.stream.config.max_http_body
-        while True:
-            size_line = await self._read_until(b"\r\n", HTTP_HEADER_LIMIT)
-            if size_line is None:
-                return None
-            try:
-                size = int(size_line.strip().split(b";")[0], 16)
-            except ValueError:
-                raise _TcpFallback("invalid chunk size") from None
-            if size == 0:
-                # trailers until blank line (usually immediate)
-                _ = await self._read_until(b"\r\n", HTTP_HEADER_LIMIT)
-                return b"".join(chunks)
-            total += size
-            if total > cap:
-                raise _TcpFallback("chunked body exceeds cap")
-            chunk = await self._read_exact(size)
-            if chunk is None:
-                return None
-            chunks.append(chunk)
-            crlf = await self._read_exact(2)
-            if crlf != b"\r\n":
-                raise _TcpFallback("malformed chunk terminator")
-
-    # -- fetch + response serialization -------------------------------------
-
-    def _build_url(self, req: HttpRequest) -> str:
-        target = req.target
-        if target.startswith("http://") or target.startswith("https://"):
-            return target  # absolute-form: honor the client's URL
-        host = self.stream.host
-        default_port = (self.scheme == "http" and self.stream.port == 80) or (
-            self.scheme == "https" and self.stream.port == 443
-        )
-        if not default_port:
-            host = f"{host}:{self.stream.port}"
-        return f"{self.scheme}://{host}{target}"
-
-    def _forwarded_request_headers(
-        self, req: HttpRequest, body: Optional[bytes]
-    ) -> list[tuple[str, str]]:
-        out: list[tuple[str, str]] = []
-        has_host = False
-        for name, value in req.headers:
-            if name in HOP_BY_HOP_HEADERS or name == "content-length":
-                continue
-            if name == "host":
-                # Honor the client's Host header (transparent-proxy semantics):
-                # a wisp CONNECT already fixed the destination, and standard
-                # clients send a Host matching it.
-                has_host = True
-            out.append((name, value))
-        if not has_host:
-            host = self.stream.host
-            default_port = (self.scheme == "http" and self.stream.port == 80) or (
-                self.scheme == "https" and self.stream.port == 443
-            )
-            if not default_port:
-                host = f"{host}:{self.stream.port}"
-            out.insert(0, ("host", host))
-        if body is not None:
-            out.append(("content-length", str(len(body))))
-        return out
-
-    async def _run(self) -> None:
-        stream = self.stream
-        sid = stream.stream_id
-        try:
-            while not self.closed:
-                req = await self._read_request()
-                if req is None:
-                    # Client closed the stream without another request.
-                    await stream.end_stream(CloseReason.VOLUNTARY, notify=False)
-                    return
-                url = self._build_url(req)
-                fwd_headers = self._forwarded_request_headers(req, req.body)
-                lease = get_governor().http.acquire  # noqa: E731 (readability)
-                gov_lease = await lease(stream.config.queue_timeout)
-                try:
-                    resp = await stream.platform.http_fetch(
-                        method=req.method,
-                        url=url,
-                        headers=fwd_headers,
-                        body=req.body,
-                        timeout=stream.config.connect_timeout,
-                    )
-                    await self._send_response(req, resp)
-                finally:
-                    gov_lease.release()
-                # Commit consumed bytes only after the response was emitted.
-                del self.buf[:self.pos]
-                self.pos = 0
-                if req.connection_close:
-                    await stream.end_stream(CloseReason.VOLUNTARY, notify=False)
-                    return
-        except _TcpFallback as fb:
-            await self._fallback_to_tcp(fb.why)
-        except SlotTimeoutError:
-            LOG.warning("[stream %d] http head throttled (queue timeout)", sid)
-            await stream.end_stream(CloseReason.THROTTLED, notify=True)
-        except OutboundConnectError as exc:
-            LOG.warning("[stream %d] fetch connect failed: %s", sid, exc.detail)
-            await stream.end_stream(exc.reason, notify=True)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            LOG.error("[stream %d] http head crashed: %r", sid, exc)
-            await stream.end_stream(CloseReason.NETWORK_ERROR, notify=True)
-
-    async def _send_response(self, req: HttpRequest, resp: Any) -> None:
-        stream = self.stream
-        sid = stream.stream_id
-        status = int(getattr(resp, "status", 502))
-        reason = str(getattr(resp, "status_text", "") or "") or REASON_PHRASES.get(
-            status, ""
-        )
-        bodyless = status in (204, 304) or req.method == "HEAD"
-
-        lines = [f"HTTP/1.1 {status} {reason}".rstrip()]
-        for name, value in getattr(resp, "headers", []):
-            lname = name.lower()
-            if lname in HOP_BY_HOP_HEADERS or lname in ("content-length", "content-encoding"):
-                # Never trust upstream length/encoding: fetch() re-frames and
-                # may transparently decompress, so we always re-frame chunked.
-                continue
-            lines.append(f"{name}: {value}")
-        lines.append("connection: close" if req.connection_close else "connection: keep-alive")
-        if not bodyless:
-            lines.append("transfer-encoding: chunked")
-        head = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1", "replace")
-        self._responses_sent += 1  # from here on, fallback is impossible
-        await stream.send_to_client(head)
-        if bodyless:
-            return
-        async for chunk in resp.body_chunks():
-            if not chunk:
-                continue
-            await stream.send_to_client(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
-        await stream.send_to_client(b"0\r\n\r\n")
-
-    async def _fallback_to_tcp(self, why: str) -> None:
-        stream = self.stream
-        if self._responses_sent > 0:
-            LOG.warning(
-                "[stream %d] cannot fall back after response sent (%s); closing",
-                stream.stream_id, why,
-            )
-            await stream.end_stream(CloseReason.NETWORK_ERROR, notify=True)
-            return
-        pending = bytes(self.buf)  # every byte the client sent so far
-        self.closed = True  # stop accepting data into this head
-        await _cancel_task(self._task)
-        LOG.info("[stream %d] falling back to live-tcp head: %s", stream.stream_id, why)
-        tcp = TcpHead(stream)
-        stream.head = tcp
-        try:
-            await tcp.start(pending)
-        except (SlotTimeoutError, OutboundConnectError) as exc:
-            reason = (
-                CloseReason.THROTTLED
-                if isinstance(exc, SlotTimeoutError)
-                else exc.reason
-            )
-            await stream.end_stream(reason, notify=True)
-
-    # -- head interface ------------------------------------------------------
-
-    async def on_data(self, data: bytes) -> None:
-        if self.closed:
-            return
-        self.buf += data
-        if len(self.buf) > 2 * self.stream.config.max_http_body:
-            # Hard memory guard; extremely unlikely to be legitimate HTTP.
-            self.closed = True
-            self._data_evt.set()
-            await _cancel_task(self._task)
-            await self.stream.end_stream(CloseReason.UNSPECIFIED, notify=True)
-            return
-        self._data_evt.set()
-
-    async def close(self) -> None:
-        if self.closed and self._task.done():
-            return
-        self.closed = True
-        self._data_evt.set()
-        await _cancel_task(self._task)
-
-
-async def _cancel_task(task: Optional["asyncio.Task[Any]"]) -> None:
-    """Cancel a task safely, never cancelling the current task."""
-    if task is None or task.done():
-        return
-    if task is asyncio.current_task():
-        return
-    task.cancel()
+            return bytes(to_bytes())
+        except Exception:  # noqa: BLE001 - fall through to buffer protocol
+            pass
     try:
-        await task
-    except (asyncio.CancelledError, Exception):
+        return bytes(data)
+    except Exception as exc:  # noqa: BLE001
+        raise TypeError(f"unsupported websocket payload {type(data)!r}") from exc
+
+
+def _to_bytes(value: Any) -> bytes:
+    """Convert a stream chunk (bytes/JS typed array) to Python bytes."""
+    return _ws_payload_to_bytes(value)
+
+
+def _js_headers_to_dict(headers: Any) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    if headers is None:
+        return result
+
+    def _collect(value: Any, name: Any, _map: Any = None) -> None:
+        result[str(name).lower()] = str(value)
+
+    proxy = create_proxy(_collect)
+    try:
+        headers.forEach(proxy)
+    except Exception:  # noqa: BLE001 - header collection is best-effort
+        pass
+    finally:
+        destroy = getattr(proxy, "destroy", None)
+        if callable(destroy):
+            try:
+                destroy()
+            except Exception:  # noqa: BLE001
+                pass
+    return result
+
+
+def _spawn_background(ctx: Any, coro: Coroutine[Any, Any, None], log: Logger) -> None:
+    """Run a coroutine past the request lifetime via ctx.waitUntil."""
+    task = asyncio.ensure_future(coro)
+    wait_until = getattr(ctx, "waitUntil", None)
+    if not callable(wait_until):
+        return
+
+    def _executor(resolve: Any, _reject: Any) -> None:
+        def _done(completed: "asyncio.Task[None]") -> None:
+            try:
+                exc = completed.exception()
+            except Exception:  # noqa: BLE001
+                exc = None
+            if exc is not None:
+                log.error("background_task_failed", error=repr(exc))
+            try:
+                resolve(None)
+            except Exception:  # noqa: BLE001
+                pass
+
+        task.add_done_callback(_done)
+
+    try:
+        wait_until(Promise.new(create_proxy(_executor)))
+    except Exception:  # noqa: BLE001 - the task keeps running regardless
         pass
 
 
 # ---------------------------------------------------------------------------
-# Section 7: Stream — per-stream state, head selection, CONTINUE pacing
+# Resource governance: 3 TCP + 3 HTTP slots with a bounded FIFO queue
 # ---------------------------------------------------------------------------
 
 
-class Stream:
-    """One multiplexed wisp stream (or one wsproxy tunnel).
+class PoolSlot:
+    """Handle proving ownership of one pool slot; release is idempotent."""
 
-    The channel object (WispSession or WsProxySession) supplies framing:
-    `send_data` wraps payloads in DATA frames for wisp and sends raw bytes for
-    wsproxy; `terminate` sends CLOSE frames for wisp and closes the tunnel for
-    wsproxy; `send_control` emits CONTINUE frames (no-op for wsproxy).
-    """
+    def __init__(self, pool: "ResourcePool") -> None:
+        self._pool = pool
+        self._released = False
 
-    def __init__(
-        self,
-        channel: "StreamChannel",
-        stream_id: int,
-        host: str,
-        port: int,
-        platform: Any,
-        config: ServerConfig,
-    ) -> None:
-        self.channel = channel
-        self.stream_id = stream_id
-        self.host = host
-        self.port = port
-        self.platform = platform
-        self.config = config
-        self.inbound: "asyncio.Queue[bytes]" = asyncio.Queue(maxsize=config.buffer_size)
-        self.head: Optional[Any] = None
-        self.packets_handed = 0
-        self.closed = False
-        self._closed_evt = asyncio.Event()
-        # Server->client flow control: ungated until the client announces a
-        # buffer via a CONTINUE packet (epoxy never does; reference ignores it).
-        self.client_buffer_remaining: Optional[int] = None
-        self._client_continue_evt = asyncio.Event()
-        self._client_continue_evt.set()
-        self._pump_task: "asyncio.Task[None]" = asyncio.ensure_future(self._pump())
-
-    # -- client -> destination ----------------------------------------------
-
-    async def on_client_data(self, payload: bytes) -> None:
-        """Enqueue a DATA payload; backpressures per the reference design."""
-        if self.closed or not payload:
+    def release(self) -> None:
+        if self._released:
             return
-        try:
-            self.inbound.put_nowait(payload)
-            return
-        except asyncio.QueueFull:
-            pass
-        # Queue full (client violated CONTINUE pacing, or head is slow).
-        # Wait for space, but bail out immediately if the stream closes.
-        put_fut = asyncio.ensure_future(self.inbound.put(payload))
-        closed_fut = asyncio.ensure_future(self._closed_evt.wait())
-        done, pending = await asyncio.wait(
-            {put_fut, closed_fut}, return_when=asyncio.FIRST_COMPLETED
-        )
-        for fut in pending:
-            fut.cancel()
-
-    def on_client_continue(self, buffer_remaining: int) -> None:
-        LOG.debug("[stream %d] client CONTINUE buffer=%d", self.stream_id, buffer_remaining)
-        self.client_buffer_remaining = max(0, buffer_remaining)
-        if buffer_remaining > 0:
-            self._client_continue_evt.set()
-        else:
-            self._client_continue_evt.clear()
-
-    async def _pump(self) -> None:
-        try:
-            # Spec: "the server must immediately try to establish a TCP socket to
-            # the specified hostname and port" — for non-head ports we connect
-            # right away; for GET/HTTP head ports (80/443) the outbound is a
-            # fetch, so head selection is deferred to the first payload bytes.
-            if self.port not in self.config.http_head_ports:
-                head = TcpHead(self)
-                await head.start(b"")
-                self.head = head
-            first = await self.inbound.get()
-            if self.head is None:
-                head = await self._select_head(first)
-                if head is None:
-                    return  # teardown already handled
-                self.head = head
-                self.packets_handed = 1
-                self._maybe_send_continue()
-            else:
-                await self.head.on_data(first)
-                self.packets_handed = 1
-                self._maybe_send_continue()
-            while True:
-                payload = await self.inbound.get()
-                # Re-read self.head: the GET/HTTP head may have swapped itself
-                # for a live-TCP head via fallback in the meantime.
-                head = self.head
-                if head is None or self.closed:
-                    return
-                await head.on_data(payload)
-                self.packets_handed += 1
-                self._maybe_send_continue()
-        except asyncio.CancelledError:
-            raise
-        except OutboundConnectError as exc:
-            LOG.warning("[stream %d] outbound connect failed: %s", self.stream_id, exc.detail)
-            await self.end_stream(exc.reason, notify=True)
-        except SlotTimeoutError:
-            LOG.warning("[stream %d] outbound slot queue timeout", self.stream_id)
-            await self.end_stream(CloseReason.THROTTLED, notify=True)
-        except Exception as exc:
-            LOG.error("[stream %d] pump crashed: %r", self.stream_id, exc)
-            await self.end_stream(CloseReason.NETWORK_ERROR, notify=True)
-
-    async def _select_head(self, first: bytes) -> Optional[Any]:
-        """Dual-head routing for HTTP-head ports (80/443): HTTP-shaped payload
-        goes to the GET/HTTP (fetch) head; TLS records or anything else go to
-        the live-TCP head."""
-        if not _looks_like_tls_start(first) and _looks_like_http_start(first):
-            LOG.debug("[stream %d] routing %s:%d to get-http head",
-                      self.stream_id, self.host, self.port)
-            head = HttpFetchHead(self)
-            await head.on_data(first)
-            return head
-        if _looks_like_tls_start(first):
-            LOG.debug("[stream %d] TLS ClientHello on port %d -> live-tcp head",
-                      self.stream_id, self.port)
-        head = TcpHead(self)
-        await head.start(first)
-        return head
-
-    def _maybe_send_continue(self) -> None:
-        """Reference pacing: CONTINUE every queue_size//4 packets handed."""
-        if self.packets_handed % CONTINUE_INTERVAL == 0:
-            remaining = max(0, self.config.buffer_size - self.inbound.qsize())
-            self.channel.send_control(continue_frame(self.stream_id, remaining))
-
-    # -- destination -> client ----------------------------------------------
-
-    async def send_to_client(self, data: bytes) -> None:
-        if self.closed:
-            return
-        if self.client_buffer_remaining is not None:
-            while self.client_buffer_remaining <= 0 and not self.closed:
-                await self._client_continue_evt.wait()
-            if self.closed:
-                return
-            self.client_buffer_remaining -= 1
-        await self.channel.send_data(self, data)
-
-    async def end_stream(self, reason: CloseReason, notify: bool) -> None:
-        if self.closed:
-            return
-        await self.channel.terminate(self, reason, notify=notify)
-
-    async def close(self) -> None:
-        """Tear down tasks and the head. Idempotent. Sends nothing."""
-        if self.closed:
-            return
-        self.closed = True
-        self._closed_evt.set()
-        self._client_continue_evt.set()
-        if self.head is not None:
-            try:
-                await self.head.close()
-            except Exception as exc:
-                LOG.debug("[stream %d] head close error: %r", self.stream_id, exc)
-            self.head = None
-        await _cancel_task(self._pump_task)
-
-
-# ---------------------------------------------------------------------------
-# Section 8: sessions — Wisp v1 (framed) and legacy wsproxy (raw tunnel)
-# ---------------------------------------------------------------------------
-
-OnMessage = Callable[[bytes], None]
-OnClose = Callable[[int, str], None]
-OnError = Callable[[str], None]
-
-
-class WispSession:
-    """One websocket carrying the Wisp v1 multiplexing protocol.
-
-    Implements the StreamChannel interface used by Stream/heads:
-    send_data / send_control / terminate.
-    """
-
-    def __init__(self, ws: Any, platform: Any, config: ServerConfig, label: str) -> None:
-        self.ws = ws
-        self.platform = platform
-        self.config = config
-        self.label = label
-        self.streams: "dict[int, Stream]" = {}
-        self.inbound: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue(
-            maxsize=WS_SESSION_QUEUE_LIMIT
-        )
-        self.frames_in = 0
-        self.frames_out = 0
-        self.bytes_in = 0
-        self.bytes_out = 0
-        self.total_streams = 0
-        self.started = time.monotonic()
-        self._stopping = False
-
-    # -- lifecycle ------------------------------------------------------------
-
-    async def run(self) -> None:
-        self.ws.set_handlers(self._on_ws_message, self._on_ws_close, self._on_ws_error)
-        # Wisp v1 handshake: initial CONTINUE, stream id 0 = protocol version.
-        self.send_frame(continue_frame(0, self.config.buffer_size))
-        LOG.info("[%s] wisp v1 session started (buffer=%d)",
-                 self.label, self.config.buffer_size)
-        try:
-            while True:
-                data = await self.inbound.get()
-                if data is None or self._stopping:
-                    break
-                self.frames_in += 1
-                self.bytes_in += len(data)
-                await self._handle_frame(data)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            LOG.error("[%s] session loop crashed: %r", self.label, exc)
-        finally:
-            await self._teardown()
-
-    async def _teardown(self) -> None:
-        self._stopping = True
-        for sid in list(self.streams.keys()):
-            await self.close_stream(sid, CloseReason.VOLUNTARY, notify=False)
-        try:
-            self.ws.close()
-        except Exception:
-            pass
-        LOG.info(
-            "[%s] session closed: %d streams, %d frames in / %d KiB, %d frames out / %d KiB, %.1fs",
-            self.label, self.total_streams, self.frames_in,
-            self.bytes_in // 1024, self.frames_out,
-            self.bytes_out // 1024,
-            time.monotonic() - self.started,
-        )
-
-    # -- websocket callbacks (synchronous, called by the platform) ------------
-
-    def _on_ws_message(self, data: bytes) -> None:
-        if self._stopping:
-            return
-        try:
-            self.inbound.put_nowait(data)
-        except asyncio.QueueFull:
-            # Only reachable when a client floods far beyond CONTINUE pacing.
-            LOG.error("[%s] inbound frame queue overflow; aborting session", self.label)
-            self._abort()
-
-    def _on_ws_close(self, code: int, reason: str) -> None:
-        LOG.debug("[%s] websocket closed (code=%s reason=%r)", self.label, code, reason)
-        self._stopping = True
-        try:
-            self.inbound.put_nowait(None)
-        except asyncio.QueueFull:
-            pass  # loop drains and checks _stopping
-
-    def _on_ws_error(self, message: str) -> None:
-        LOG.warning("[%s] websocket error: %s", self.label, message)
-        self._stopping = True
-        try:
-            self.inbound.put_nowait(None)
-        except asyncio.QueueFull:
-            pass
-
-    def _abort(self) -> None:
-        self._stopping = True
-        try:
-            self.inbound.put_nowait(None)
-        except asyncio.QueueFull:
-            pass
-        try:
-            self.ws.close()
-        except Exception:
-            pass
-
-    # -- frame dispatch --------------------------------------------------------
-
-    async def _handle_frame(self, data: bytes) -> None:
-        if len(data) < 5:
-            LOG.debug("[%s] dropping short frame (%d bytes)", self.label, len(data))
-            return
-        ptype, sid = HEADER_STRUCT.unpack_from(data, 0)
-        payload = data[5:]
-        if ptype == int(PacketType.CONNECT):
-            await self._handle_connect(sid, payload)
-        elif ptype == int(PacketType.DATA):
-            stream = self.streams.get(sid)
-            if stream is None:
-                LOG.debug("[%s] DATA for unknown stream %d ignored", self.label, sid)
-                return
-            await stream.on_client_data(payload)
-        elif ptype == int(PacketType.CONTINUE):
-            if len(payload) != 4:
-                LOG.debug("[%s] malformed CONTINUE on stream %d ignored", self.label, sid)
-                return
-            (value,) = CONTINUE_PAYLOAD_STRUCT.unpack(payload)
-            stream = self.streams.get(sid)
-            if stream is not None:
-                stream.on_client_continue(value)
-        elif ptype == int(PacketType.CLOSE):
-            reason = payload[0] if payload else int(CloseReason.UNSPECIFIED)
-            LOG.debug("[%s] CLOSE stream %d from client (reason=0x%02x)",
-                      self.label, sid, reason)
-            await self.close_stream(sid, CloseReason.VOLUNTARY, notify=False)
-        else:
-            LOG.debug("[%s] unknown packet type 0x%02x ignored", self.label, ptype)
-
-    async def _handle_connect(self, sid: int, payload: bytes) -> None:
-        if sid == 0:
-            LOG.warning("[%s] CONNECT with reserved stream id 0 rejected", self.label)
-            self.send_frame(close_frame(sid, int(CloseReason.INVALID_INFO)))
-            return
-        if sid in self.streams:
-            LOG.warning("[%s] CONNECT reusing live stream id %d rejected", self.label, sid)
-            self.send_frame(close_frame(sid, int(CloseReason.INVALID_INFO)))
-            return
-        if len(self.streams) >= self.config.max_streams:
-            LOG.warning("[%s] stream limit %d reached (0x49)",
-                        self.label, self.config.max_streams)
-            self.send_frame(close_frame(sid, int(CloseReason.THROTTLED)))
-            return
-        try:
-            req = parse_connect_payload(payload)
-        except UdpUnsupported:
-            LOG.info("[%s] CONNECT stream %d: UDP is blocked on this server (0x48)",
-                     self.label, sid)
-            self.send_frame(close_frame(sid, int(CloseReason.ADDRESS_BLOCKED)))
-            return
-        except InvalidConnectPayload as exc:
-            LOG.info("[%s] CONNECT stream %d invalid: %s (0x41)", self.label, sid, exc)
-            self.send_frame(close_frame(sid, int(CloseReason.INVALID_INFO)))
-            return
-        if (
-            self.config.allowed_host_regex is not None
-            and self.config.allowed_host_regex.match(req.hostname) is None
-        ):
-            LOG.info("[%s] CONNECT stream %d to %s blocked by policy (0x48)",
-                     self.label, sid, req.dest)
-            self.send_frame(close_frame(sid, int(CloseReason.ADDRESS_BLOCKED)))
-            return
-        LOG.info("[%s] stream %d connect -> %s", self.label, sid, req.dest)
-        self.total_streams += 1
-        self.streams[sid] = Stream(self, sid, req.hostname, req.port,
-                                   self.platform, self.config)
-
-    # -- StreamChannel interface ------------------------------------------------
-
-    def send_frame(self, frame: bytes) -> None:
-        self.frames_out += 1
-        self.bytes_out += len(frame)
-        try:
-            self.ws.send(frame)
-        except Exception as exc:
-            LOG.debug("[%s] ws send failed (socket closed?): %r", self.label, exc)
-
-    async def send_data(self, stream: "Stream", data: bytes) -> None:
-        self.send_frame(data_frame(stream.stream_id, data))
-
-    def send_control(self, frame: bytes) -> None:
-        self.send_frame(frame)
-
-    async def terminate(
-        self, stream: "Stream", reason: CloseReason, notify: bool = True
-    ) -> None:
-        await self.close_stream(stream.stream_id, reason, notify=notify)
-
-    async def close_stream(self, sid: int, reason: CloseReason, notify: bool = True) -> None:
-        stream = self.streams.pop(sid, None)
-        if stream is None:
-            return
-        if notify:
-            self.send_frame(close_frame(sid, int(reason)))
-        await stream.close()
-
-
-class WsProxySession:
-    """Legacy wsproxy tunnel: one raw TCP connection over one websocket.
-
-    Path shape: anything not ending in "/", whose final segment parses as
-    "host:port" (e.g. /proxy/example.com:443). No wisp framing: every binary
-    websocket message is a raw TCP chunk in either direction.
-    """
-
-    def __init__(
-        self, ws: Any, platform: Any, config: ServerConfig,
-        host: str, port: int, label: str,
-    ) -> None:
-        self.ws = ws
-        self.platform = platform
-        self.config = config
-        self.host = host
-        self.port = port
-        self.label = label
-        self.stream: Optional[Stream] = None
-        self.inbound: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue(
-            maxsize=WS_SESSION_QUEUE_LIMIT
-        )
-        self.bytes_in = 0
-        self.bytes_out = 0
-        self.started = time.monotonic()
-        self._stopping = False
-
-    async def run(self) -> None:
-        self.ws.set_handlers(self._on_ws_message, self._on_ws_close, self._on_ws_error)
-        LOG.info("[%s] wsproxy tunnel to %s:%d", self.label, self.host, self.port)
-        self.stream = Stream(self, 0, self.host, self.port, self.platform, self.config)
-        try:
-            while True:
-                data = await self.inbound.get()
-                if data is None or self._stopping or self.stream is None:
-                    break
-                self.bytes_in += len(data)
-                await self.stream.on_client_data(data)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            LOG.error("[%s] wsproxy loop crashed: %r", self.label, exc)
-        finally:
-            await self._teardown()
-
-    async def _teardown(self) -> None:
-        self._stopping = True
-        if self.stream is not None:
-            await self.stream.close()
-            self.stream = None
-        try:
-            self.ws.close()
-        except Exception:
-            pass
-        LOG.info("[%s] wsproxy tunnel closed: %d KiB in / %d KiB out, %.1fs",
-                 self.label, self.bytes_in // 1024, self.bytes_out // 1024,
-                 time.monotonic() - self.started)
-
-    def _on_ws_message(self, data: bytes) -> None:
-        if self._stopping:
-            return
-        try:
-            self.inbound.put_nowait(data)
-        except asyncio.QueueFull:
-            LOG.error("[%s] wsproxy inbound overflow; aborting", self.label)
-            self._stopping = True
-            try:
-                self.inbound.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
-            try:
-                self.ws.close()
-            except Exception:
-                pass
-
-    def _on_ws_close(self, code: int, reason: str) -> None:
-        self._stopping = True
-        try:
-            self.inbound.put_nowait(None)
-        except asyncio.QueueFull:
-            pass
-
-    def _on_ws_error(self, message: str) -> None:
-        LOG.warning("[%s] wsproxy websocket error: %s", self.label, message)
-        self._on_ws_close(0, message)
-
-    # -- StreamChannel interface (no wisp framing on this path) -----------------
-
-    def send_frame(self, frame: bytes) -> None:
-        self.bytes_out += len(frame)
-        try:
-            self.ws.send(frame)
-        except Exception as exc:
-            LOG.debug("[%s] ws send failed: %r", self.label, exc)
-
-    async def send_data(self, stream: "Stream", data: bytes) -> None:
-        self.send_frame(data)
-
-    def send_control(self, frame: bytes) -> None:
-        pass  # CONTINUE frames are wisp-only; wsproxy has no flow control
-
-    async def terminate(
-        self, stream: "Stream", reason: CloseReason, notify: bool = True
-    ) -> None:
-        LOG.debug("[%s] tunnel ended (reason=0x%02x)", self.label, int(reason))
-        if stream is self.stream:
-            self.stream = None
-        await stream.close()
-        self._stopping = True
-        try:
-            self.ws.close()
-        except Exception:
-            pass
-
-
-# ---------------------------------------------------------------------------
-# Section 9: platform bridge — Cloudflare Workers (pyodide) implementation
-# ---------------------------------------------------------------------------
-
-_CF_CONNECT: Any = None
-
-
-def _cf_connect() -> Any:
-    """Lazily resolve cloudflare:sockets.connect (per-isolate cache)."""
-    global _CF_CONNECT
-    if _CF_CONNECT is None:
-        if not WORKERS_RUNTIME:
-            raise RuntimeError(
-                "cloudflare:sockets is only available inside the Workers runtime"
-            )
-        _CF_CONNECT = _import_from_javascript("cloudflare:sockets").connect
-    return _CF_CONNECT
-
-
-class CloudflareTcpConnection:
-    """A cloudflare:sockets TCP socket exposed as read()/write()/close()."""
-
-    def __init__(self, js_socket: Any) -> None:
-        self._sock = js_socket
-        self._reader = js_socket.readable.getReader()
-        self._writer = js_socket.writable.getWriter()
-
-    async def read(self) -> Optional[bytes]:
-        result = await self._reader.read()
-        if bool(result.done):
-            return None
-        return bytes(result.value.to_bytes())
-
-    async def write(self, data: bytes) -> None:
-        await self._writer.write(_to_js(data))
-
-    def close(self) -> None:
-        try:
-            self._sock.close()
-        except Exception:
-            pass
-
-
-class CloudflareFetchResponse:
-    """A fetch() Response with a list of headers and a chunk async-iterator."""
-
-    def __init__(self, status: int, status_text: str,
-                 headers: "list[tuple[str, str]]", reader: Any) -> None:
-        self.status = status
-        self.status_text = status_text
-        self.headers = headers
-        self._reader = reader
-
-    async def body_chunks(self):
-        if self._reader is None:
-            return
-        while True:
-            chunk = await self._reader.read()
-            if bool(chunk.done):
-                break
-            data = bytes(chunk.value.to_bytes())
-            if data:
-                yield data
-
-
-class CloudflarePlatform:
-    """Production platform: cloudflare:sockets for live-TCP, fetch for HTTP."""
-
-    async def _await_js(self, promise: Any) -> Any:
-        """Await a JS promise inside a real coroutine so asyncio.wait_for's
-        ensure_future accepts it (a bare JsProxy is not always a Future)."""
-        return await promise
-
-    async def tcp_connect(self, host: str, port: int, timeout: float) -> CloudflareTcpConnection:
-        address = f"{host}:{port}"
-        try:
-            sock = _cf_connect()(address)
-        except Exception as exc:
-            raise OutboundConnectError(
-                classify_connect_failure(exc), f"connect({address}) failed: {exc}"
-            ) from exc
-        try:
-            await asyncio.wait_for(self._await_js(sock.opened), timeout)
-        except asyncio.TimeoutError:
-            try:
-                sock.close()
-            except Exception:
-                pass
-            raise OutboundConnectError(
-                CloseReason.CONNECT_TIMEOUT,
-                f"connect({address}) timed out after {timeout:.1f}s",
-            ) from None
-        except Exception as exc:
-            try:
-                sock.close()
-            except Exception:
-                pass
-            raise OutboundConnectError(
-                classify_connect_failure(exc), f"connect({address}) failed: {exc}"
-            ) from exc
-        return CloudflareTcpConnection(sock)
-
-    async def http_fetch(
-        self,
-        method: str,
-        url: str,
-        headers: "list[tuple[str, str]]",
-        body: Optional[bytes],
-        timeout: float,
-    ) -> CloudflareFetchResponse:
-        init: "dict[str, Any]" = {
-            "method": method,
-            "redirect": "manual",
-            "headers": dict(headers),
+        self._released = True
+        self._pool.release_slot()
+
+
+class ResourcePool:
+    """Async pool with hard limit, bounded FIFO waiters and metrics."""
+
+    def __init__(self, name: str, limit: int) -> None:
+        self.name = name
+        self._limit = limit
+        self._semaphore = asyncio.Semaphore(limit)
+        self._in_use = 0
+        self._waiting = 0
+        self._total_acquired = 0
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def in_use(self) -> int:
+        return self._in_use
+
+    @property
+    def waiting(self) -> int:
+        return self._waiting
+
+    def metrics(self) -> Dict[str, int]:
+        return {
+            "limit": self._limit,
+            "in_use": self._in_use,
+            "waiting": self._waiting,
+            "total_acquired": self._total_acquired,
         }
-        if body is not None:
-            init["body"] = _to_js(body)
-        try:
-            resp = await asyncio.wait_for(
-                self._await_js(_js_fetch(url, _to_js(init, dict_converter=_JsObject.fromEntries))),
-                timeout,
+
+    async def acquire(
+        self,
+        queue_limit: int,
+        timeout_s: float,
+        log: Logger,
+        stream_id: int,
+    ) -> PoolSlot:
+        """Acquire one slot, queueing behind at most ``queue_limit`` waiters.
+
+        Every acquisition goes through the semaphore: a released credit is
+        handed directly to the first waiter by asyncio.Semaphore, so a
+        late arrival can never jump the queue (locked() stays true while a
+        credit is in flight to a waiter)."""
+        if self._semaphore.locked():
+            # All slots are in use: apply queue admission control, then wait.
+            if self._waiting >= queue_limit:
+                raise PoolQueueFullError(
+                    f"pool {self.name!r} queue full ({self._waiting}/{queue_limit})"
+                )
+            self._waiting += 1
+            log.debug(
+                "pool_queued",
+                pool=self.name,
+                stream=stream_id,
+                waiting=self._waiting,
+                in_use=self._in_use,
             )
-        except asyncio.TimeoutError:
-            raise OutboundConnectError(
-                CloseReason.CONNECT_TIMEOUT, f"fetch({url}) timed out after {timeout:.1f}s"
-            ) from None
-        except Exception as exc:
-            raise OutboundConnectError(
-                classify_connect_failure(exc), f"fetch({url}) failed: {exc}"
-            ) from exc
-        status = int(resp.status)
-        status_text = str(getattr(resp, "statusText", "") or "")
-        header_list: "list[tuple[str, str]]" = []
-        try:
-            # NB: `Array.from` cannot be spelled `_JsArray.from(...)` in Python
-            # (`from` is a keyword), hence the getattr indirection.
-            js_from = getattr(_JsArray, "from")
-            for pair in js_from(resp.headers.entries()).to_py():
-                header_list.append((str(pair[0]), str(pair[1])))
-        except Exception as exc:
-            LOG.debug("fetch(%s): header enumeration failed: %r", url, exc)
-        try:  # preserve multiple Set-Cookie headers if the runtime exposes them
-            for value in resp.headers.getSetCookie().to_py():
-                header_list.append(("set-cookie", str(value)))
-        except Exception:
-            pass
-        reader = None
-        if resp.body is not None:
-            reader = resp.body.getReader()
-        return CloudflareFetchResponse(status, status_text, header_list, reader)
-
-
-class JsWsServerSocket:
-    """The server end of a WebSocketPair behind the harness-compatible
-    interface: set_handlers / send / close (all binary frames)."""
-
-    def __init__(self, js_ws: Any) -> None:
-        self.ws = js_ws
-        try:
-            self.ws.binaryType = "arraybuffer"  # must be set before accept()
-        except Exception:
-            pass
-        # Keep strong references so pyodide never GCs the closures.
-        self._message_impl: Optional[Callable[[Any], None]] = None
-        self._close_impl: Optional[Callable[[Any], None]] = None
-        self._error_impl: Optional[Callable[[Any], None]] = None
-
-    def accept(self) -> None:
-        self.ws.accept()
-
-    def set_handlers(self, on_message: OnMessage, on_close: OnClose, on_error: OnError) -> None:
-        def _message(evt: Any) -> None:
             try:
-                data = evt.data
-                if isinstance(data, str):
-                    LOG.debug("[ws] ignoring non-binary frame (%d chars)", len(data))
-                    return
-                on_message(bytes(data.to_bytes()))
-            except Exception as exc:
-                LOG.error("[ws] message handler failed: %r", exc)
-
-        def _close(evt: Any) -> None:
-            try:
-                code = int(evt.code)
-            except Exception:
-                code = 0
-            try:
-                reason = str(evt.reason or "")
-            except Exception:
-                reason = ""
-            on_close(code, reason)
-
-        def _error(evt: Any) -> None:
-            on_error(str(evt))
-
-        self._message_impl, self._close_impl, self._error_impl = _message, _close, _error
-        self.ws.onmessage = _message
-        self.ws.onclose = _close
-        self.ws.onerror = _error
-
-    def send(self, data: bytes) -> None:
-        self.ws.send(_to_js(data))
-
-    def close(self) -> None:
-        try:
-            self.ws.close(1000, "server closing")
-        except Exception:
-            pass
-
-
-# ---------------------------------------------------------------------------
-# Section 10: HTTP routing + the Workers entrypoint
-# ---------------------------------------------------------------------------
-
-_BACKGROUND_TASKS: "set[asyncio.Task[Any]]" = set()
-_STARTUP_LOGGED = False
-
-
-def _new_conn_label() -> str:
-    return f"{random.getrandbits(32):08x}"
-
-
-@dataclass
-class WorkerResponse:
-    """Environment-neutral response; converted per runtime at the edges."""
-
-    status: int
-    body: bytes = b""
-    content_type: str = "text/plain; charset=utf-8"
-    websocket: Any = None  # client end of the pair for 101 responses
-
-
-def _parse_wsproxy_target(path: str) -> "tuple[Optional[str], Optional[int], Optional[str]]":
-    segment = path.rstrip("/").rsplit("/", 1)[-1]
-    host, sep, port_s = segment.rpartition(":")
-    if not sep or not host:
-        return None, None, "expected .../host:port path"
-    try:
-        port = int(port_s)
-    except ValueError:
-        return None, None, f"invalid port {port_s!r}"
-    if not 1 <= port <= 65535:
-        return None, None, f"port {port} out of range"
-    if len(host) > 255:
-        return None, None, "hostname too long"
-    return host, port, None
-
-
-LANDING_HTML = f"""<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width">
-    <title>wisp-workers-python</title>
-    <style>
-      html {{ color-scheme: light dark; }}
-      body {{ font-family: sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }}
-      code {{ background: rgba(127,127,127,.15); padding: .1rem .3rem; border-radius: .3rem; }}
-      pre {{ white-space: pre-wrap; background: rgba(127,127,127,.1); padding: 1rem; border-radius: .5rem; }}
-    </style>
-  </head>
-  <body>
-    <h1>wisp-workers-python</h1>
-    <p>A <a href="https://github.com/MercuryWorkshop/wisp-protocol">Wisp v1</a> server running on
-      Cloudflare Workers (Python) — v{__version__}.</p>
-    <ul>
-      <li>Protocol: Wisp v1 over WebSocket — connect to any path ending in <code>/</code>
-        (traditionally <code>/wisp/</code>).</li>
-      <li>Legacy wsproxy tunnels: <code>/host:port</code> paths.</li>
-      <li>Outbound dual head: ports 80/443 HTTP traffic is delegated to <code>fetch()</code>;
-        all other TCP traffic is tunneled via <code>cloudflare:sockets</code>.</li>
-      <li>Congestion: {TCP_SLOTS} live-TCP + {HTTP_SLOTS} GET/HTTP in-flight requests
-        (strict {TOTAL_OUTBOUND_SLOTS}), FIFO queued.</li>
-      <li>UDP is not supported (Workers runtime limitation).</li>
-    </ul>
-    <pre>wisp-workers-python: a Wisp v1 server for Cloudflare Workers, written in Python
-Ported from wisp-server-python — Copyright (C) 2025 Mercury Workshop (AGPL-3.0)
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.</pre>
-  </body>
-</html>
-""".encode("utf-8")
-
-
-async def route_request(
-    request: Any,
-    platform: Any,
-    config: ServerConfig,
-    ws_factory: Callable[[], "tuple[Any, Any]"],
-    keep_alive: Callable[["asyncio.Task[Any]"], None],
-) -> WorkerResponse:
-    """Shared request routing, used by the Workers entrypoint and the local
-    test harness (which supplies its own platform/websocket factory)."""
-    url = str(getattr(request, "url", "/") or "/")
-    method = str(getattr(request, "method", "GET") or "GET").upper()
-    headers = getattr(request, "headers", None)
-
-    def hget(name: str) -> str:
-        try:
-            value = headers.get(name)
-        except Exception:
-            value = None
-        return str(value) if value is not None else ""
-
-    upgrade = hget("Upgrade").strip().lower()
-    path = urlsplit(url).path or "/"
-
-    if upgrade == "websocket":
-        if config.password is not None and f"/{config.password}/" not in path:
-            LOG.warning("websocket rejected: bad password in path %r", path)
-            return WorkerResponse(401, b"401 unauthorized: missing or wrong password\n")
-        if path.endswith("/"):
-            client_ws, server_ws = ws_factory()
-            label = _new_conn_label()
-            session = WispSession(server_ws, platform, config, label)
+                await asyncio.wait_for(self._semaphore.acquire(), timeout_s)
+            except asyncio.TimeoutError as exc:
+                raise PoolAcquireTimeoutError(
+                    f"pool {self.name!r} queue timeout after {timeout_s:.2f}s"
+                ) from exc
+            finally:
+                self._waiting -= 1
         else:
-            host, port, err = _parse_wsproxy_target(path)
-            if err is not None:
-                LOG.warning("websocket path %r invalid: %s", path, err)
-                return WorkerResponse(400, f"400 bad request: {err}\n".encode())
-            client_ws, server_ws = ws_factory()
-            label = _new_conn_label()
-            session = WsProxySession(server_ws, platform, config, host, port, label)
-        task = asyncio.ensure_future(session.run())
-        keep_alive(task)
-        return WorkerResponse(101, b"", websocket=client_ws)
+            # Fast path: a credit is available and no waiter can be queued
+            # (waiters only exist while the semaphore is locked), so this
+            # acquisition is immediate and cannot steal from anyone.
+            await self._semaphore.acquire()
+        self._in_use += 1
+        self._total_acquired += 1
+        log.debug("pool_acquired", pool=self.name, stream=stream_id, in_use=self._in_use)
+        return PoolSlot(self)
 
-    # Plain HTTP: informational landing page (parity with the reference).
-    if path in ("/", "/index.html"):
-        return WorkerResponse(200, LANDING_HTML, "text/html; charset=utf-8")
-    return WorkerResponse(404, b"404 not found\n")
+    def release_slot(self) -> None:
+        self._in_use = max(0, self._in_use - 1)
+        self._semaphore.release()
 
 
-def _make_workers_response(resp: WorkerResponse) -> Any:
-    if resp.status == 101:
-        return _WorkersResponse(None, status=101, web_socket=resp.websocket)
-    return _WorkersResponse(
-        resp.body, status=resp.status,
-        headers={"content-type": resp.content_type},
-    )
+class WispPools:
+    """Global (per-isolate) pair of resource pools: 3 TCP + 3 GET/HTTP."""
+
+    def __init__(self) -> None:
+        self.tcp = ResourcePool("tcp", MAX_TCP_SLOTS)
+        self.http = ResourcePool("http", MAX_HTTP_SLOTS)
+
+    def snapshot(self) -> Dict[str, Dict[str, int]]:
+        return {"tcp": self.tcp.metrics(), "http": self.http.metrics()}
 
 
-class Default(_WorkerEntrypoint):  # type: ignore[misc,valid-type]
-    """Cloudflare Workers entrypoint.
+_POOLS = WispPools()
 
-    Routes websocket upgrades to Wisp v1 sessions (paths ending in "/") or
-    legacy wsproxy tunnels (/host:port), and serves a landing page otherwise.
-    """
+# ---------------------------------------------------------------------------
+# HTTP request parsing (GET head) + chunked decoding
+# ---------------------------------------------------------------------------
 
-    async def fetch(self, request: Any) -> Any:
-        global _STARTUP_LOGGED
-        config = ServerConfig.from_env(getattr(self, "env", None))
-        configure_logging(config.log_level)
-        if not _STARTUP_LOGGED:
-            _STARTUP_LOGGED = True
-            LOG.info("wisp-workers-python v%s ready (workers_runtime=%s, %s)",
-                     __version__, WORKERS_RUNTIME, get_governor().stats())
 
-        def ws_factory() -> "tuple[Any, JsWsServerSocket]":
-            pair = _JsWebSocketPair.new()
-            client_ws, server_js = pair.object_values()
-            wrapper = JsWsServerSocket(server_js)
-            wrapper.accept()
-            return client_ws, wrapper
+class TcpFallbackNeeded(Exception):
+    """The client's bytes are not plain HTTP; relay them over raw TCP."""
 
-        def keep_alive(task: "asyncio.Task[Any]") -> None:
-            # Strong ref (GC safety) + waitUntil (invocation lifetime safety).
-            _BACKGROUND_TASKS.add(task)
-            task.add_done_callback(_BACKGROUND_TASKS.discard)
-            ctx = getattr(self, "ctx", None)
-            if ctx is not None:
-                try:
-                    ctx.waitUntil(task)
-                except Exception as exc:
-                    LOG.debug("waitUntil failed: %r", exc)
+    def __init__(self, data: bytes) -> None:
+        super().__init__("tcp fallback needed")
+        self.data = data
 
+
+class HttpHeadTooLarge(Exception):
+    """Request head/body exceeded the configured cap."""
+
+
+@dataclass(frozen=True)
+class HttpRequest:
+    method: str
+    target: str
+    version: str
+    headers: Dict[str, str]
+    body: Optional[bytes]
+
+
+def _looks_like_http(chunk: bytes) -> bool:
+    if not chunk:
+        return False
+    first = chunk[0:1]
+    if not (b"A" <= first <= b"Z"):
+        return False  # e.g. a TLS ClientHello starts with 0x16
+    head = chunk[:32]
+    return b" " in head or b"\r" in head or b"\n" in head
+
+
+class HttpRequestParser:
+    """Incremental HTTP/1.1 request parser with Content-Length/chunked body
+    support.  Raises :class:`TcpFallbackNeeded` as soon as the stream is
+    proven not to carry a plain-HTTP request."""
+
+    def __init__(self, max_head: int, max_body: int) -> None:
+        self._max_head = max_head
+        self._max_body = max_body
+        self._buf = bytearray()
+        self._head: Optional[Tuple[str, str, str, Dict[str, str]]] = None
+        self._body = bytearray()
+        self._content_length: Optional[int] = None
+        self._chunked = False
+        self._chunk_size: Optional[int] = None
+        self._chunk_final = False
+
+    # -- public API ---------------------------------------------------------
+    @property
+    def complete(self) -> bool:
+        if self._head is None:
+            return False
+        if self._chunked:
+            return self._chunk_final
+        if self._content_length is None:
+            return True
+        return len(self._body) >= self._content_length
+
+    @property
+    def raw(self) -> bytes:
+        return bytes(self._buf) + bytes(self._body)
+
+    def feed(self, chunk: bytes) -> None:
+        if self._head is None:
+            if not self._buf and chunk and not _looks_like_http(chunk):
+                raise TcpFallbackNeeded(bytes(chunk))
+            self._buf.extend(chunk)
+            if len(self._buf) > self._max_head and b"\r\n\r\n" not in self._buf:
+                raise HttpHeadTooLarge(f"head exceeds {self._max_head} bytes")
+            self._try_parse_head()
+        else:
+            self._buf.extend(chunk)
+            if len(self._buf) > self._max_head + self._max_body + 4096:
+                raise HttpHeadTooLarge("body backlog exceeds cap")
+            self._consume_body_buffer()
+
+    def build(self) -> HttpRequest:
+        if self._head is None or not self.complete:
+            raise ValueError("parser is not complete")
+        method, target, version, headers = self._head
+        body: Optional[bytes] = None
+        if self._chunked:
+            body = bytes(self._body)
+        elif self._content_length is not None and self._content_length > 0:
+            body = bytes(self._body[: self._content_length])
+        return HttpRequest(method=method, target=target, version=version, headers=headers, body=body)
+
+    # -- internals ------------------------------------------------------------
+    def _try_parse_head(self) -> None:
+        idx = self._buf.find(b"\r\n\r\n")
+        if idx < 0:
+            return
+        head_bytes = bytes(self._buf[:idx])
+        self._buf = bytearray(self._buf[idx + 4 :])
         try:
-            resp = await route_request(
-                request, CloudflarePlatform(), config, ws_factory, keep_alive
-            )
-        except Exception as exc:
-            LOG.error("[entrypoint] route_request failed: %r", exc)
-            return _make_workers_response(
-                WorkerResponse(500, b"500 internal server error\n")
-            )
-        return _make_workers_response(resp)
+            self._head = self._parse_head_bytes(head_bytes)
+        except ValueError:
+            # ASCII garbage that never parses as HTTP - fall back to raw TCP.
+            raise TcpFallbackNeeded(head_bytes + b"\r\n\r\n" + bytes(self._buf)) from None
+        self._consume_body_buffer()
 
+    @staticmethod
+    def _parse_head_bytes(head_bytes: bytes) -> Tuple[str, str, str, Dict[str, str]]:
+        lines = head_bytes.split(b"\r\n")
+        request_line = lines[0].decode("latin-1", "replace").strip()
+        parts = request_line.split()
+        if len(parts) != 3 or not parts[2].upper().startswith("HTTP/"):
+            raise ValueError(f"malformed request line: {request_line!r}")
+        method, target, version = parts[0].upper(), parts[1], parts[2].upper()
+        if method not in _HTTP_METHODS:
+            raise ValueError(f"unknown method {method!r}")
+        headers: Dict[str, str] = {}
+        last_name: Optional[str] = None
+        for raw_line in lines[1:]:
+            if not raw_line:
+                continue
+            if raw_line[:1] in (b" ", b"\t") and last_name is not None:  # obs-fold
+                headers[last_name] += " " + raw_line.decode("latin-1", "replace").strip()
+                continue
+            if b":" not in raw_line:
+                raise ValueError("header line without colon")
+            raw_name, _, raw_value = raw_line.partition(b":")
+            name = raw_name.decode("latin-1", "replace").strip().lower()
+            headers[name] = raw_value.decode("latin-1", "replace").strip()
+            last_name = name
+        return method, target, version, headers
+
+    def _consume_body_buffer(self) -> None:
+        assert self._head is not None
+        headers = self._head[3]
+        if self._content_length is None and not self._chunked:
+            if headers.get("transfer-encoding", "").lower().find("chunked") >= 0:
+                self._chunked = True
+            else:
+                cl = headers.get("content-length")
+                if cl is None:
+                    self._content_length = 0
+                    return
+                if not cl.strip().isdigit():
+                    raise ValueError(f"bad content-length {cl!r}")
+                self._content_length = int(cl)
+                if self._content_length > self._max_body:
+                    raise HttpHeadTooLarge(f"body exceeds {self._max_body} bytes")
+        if self._chunked:
+            self._consume_chunked()
+        else:
+            assert self._content_length is not None
+            take = min(len(self._buf), self._content_length - len(self._body))
+            if take > 0:
+                self._body.extend(self._buf[:take])
+                del self._buf[:take]
+
+    def _consume_chunked(self) -> None:
+        while True:
+            if self._chunk_final:
+                return
+            if self._chunk_size is None:
+                idx = self._buf.find(b"\r\n")
+                if idx < 0:
+                    if len(self._buf) > 64:
+                        raise ValueError("chunk size line too long")
+                    return
+                size_token = bytes(self._buf[:idx]).split(b";", 1)[0].strip()
+                del self._buf[: idx + 2]
+                try:
+                    size = int(size_token, 16)
+                except ValueError as exc:
+                    raise ValueError(f"bad chunk size {size_token!r}") from exc
+                if size < 0:
+                    raise ValueError("negative chunk size")
+                if size == 0:
+                    # trailer section: consume up to (and including) the blank line
+                    if self._buf.startswith(b"\r\n"):
+                        del self._buf[:2]
+                        self._chunk_final = True
+                    elif not self._buf:
+                        return
+                    else:
+                        trailer_end = self._buf.find(b"\r\n\r\n")
+                        single = self._buf.find(b"\r\n")
+                        if trailer_end >= 0:
+                            del self._buf[: trailer_end + 4]
+                            self._chunk_final = True
+                        elif single == 0:
+                            del self._buf[:2]
+                            self._chunk_final = True
+                        elif single > 0:
+                            # a trailer line arrived, the blank line has not:
+                            del self._buf[: single + 2]
+                    return
+                self._chunk_size = size
+                continue
+            size = self._chunk_size
+            needed = size + 2
+            if len(self._buf) < needed:
+                return
+            if bytes(self._buf[size : size + 2]) != b"\r\n":
+                raise ValueError("chunk data not CRLF terminated")
+            self._body.extend(self._buf[:size])
+            del self._buf[:needed]
+            self._chunk_size = None
+            if len(self._body) > self._max_body:
+                raise HttpHeadTooLarge(f"chunked body exceeds {self._max_body} bytes")
+
+
+# ---------------------------------------------------------------------------
+# HTTP response synthesis (GET head)
+# ---------------------------------------------------------------------------
+
+
+def _chunk_encode(data: bytes) -> bytes:
+    return f"{len(data):x}\r\n".encode("ascii") + data + b"\r\n"
+
+
+def _build_fetch_url(target: str, host: str, port: int) -> str:
+    lowered = target.lower()
+    if lowered.startswith("http://") or lowered.startswith("https://"):
+        return target
+    path = target if target.startswith("/") else "/" + target
+    if ":" in host and not host.startswith("["):
+        authority = f"[{host}]"
+    else:
+        authority = host
+    scheme = "https" if port == 443 else "http"
+    return f"{scheme}://{authority}{path}"
+
+
+# ---------------------------------------------------------------------------
+# Wisp stream
+# ---------------------------------------------------------------------------
+
+
+class WispStream:
+    """One multiplexed Wisp stream (client-side initiated TCP connection)."""
+
+    def __init__(self, conn: "WispConnection", stream_id: int) -> None:
+        self.conn = conn
+        self.stream_id = stream_id
+        self.inbound: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue()
+        self.slot: Optional[PoolSlot] = None
+        self.tx_packets = INITIAL_TX_PACKETS
+        self.tx_unacked_bytes = 0
+        self.recv_packets = 0
+        self.sent_packets = 0
+        self.sent_bytes = 0
+        self._tx_wake = asyncio.Event()
+        self._client_closed = False
+        self._server_closed = False
+        self._disposed = False
+        self.created = time.monotonic()
+
+    # -- lifecycle ----------------------------------------------------------
+    @property
+    def is_finished(self) -> bool:
+        return self._client_closed or self._server_closed or self._disposed
+
+    @property
+    def disposed(self) -> bool:
+        return self._disposed
+
+    def mark_client_closed(self) -> None:
+        if self._client_closed or self._disposed:
+            return
+        self._client_closed = True
+        self.inbound.put_nowait(None)
+
+    def finish_server(self) -> None:
+        self._server_closed = True
+        self._tx_wake.set()
+
+    def dispose(self) -> None:
+        """Idempotent teardown: wake pumps and release the pool slot once."""
+        if self._disposed:
+            return
+        self._disposed = True
+        self._tx_wake.set()
+        self.release_slot()
+
+    def release_slot(self) -> None:
+        slot, self.slot = self.slot, None
+        if slot is not None:
+            slot.release()
+
+    def attach_slot(self, slot: PoolSlot) -> None:
+        self.slot = slot
+
+    # -- client -> server ------------------------------------------------------
+    def feed(self, payload: bytes) -> None:
+        if self.is_finished:
+            return
+        if self.inbound.qsize() >= INBOUND_QUEUE_LIMIT:
+            self.conn.log.warn(
+                "stream_throttled",
+                stream=self.stream_id,
+                buffered=self.inbound.qsize(),
+            )
+            self.conn.send_close(self.stream_id, REASON_THROTTLED)
+            self.finish_server()
+            return
+        self.recv_packets += 1
+        self.inbound.put_nowait(payload)
+
+    async def recv(self, timeout_s: Optional[float] = None) -> Optional[bytes]:
+        """Next inbound chunk, or None when the client closed the stream."""
+        if timeout_s is None:
+            item = await self.inbound.get()
+        else:
+            if timeout_s <= 0:
+                raise asyncio.TimeoutError()
+            item = await asyncio.wait_for(self.inbound.get(), timeout_s)
+        return item
+
+    # -- server -> client ------------------------------------------------------
+    def notify_continue(self, credit: Optional[int]) -> None:
+        if self.is_finished:
+            return
+        if credit is None:  # classic CONTINUE: one more packet may be sent
+            self.tx_packets = min(self.tx_packets + 1, TX_PACKET_CAP)
+        elif credit > 0:  # v1.2/v2: announced buffer-remaining
+            self.tx_packets = min(max(self.tx_packets, credit), TX_PACKET_CAP)
+        self.tx_unacked_bytes = 0  # client consumed everything sent so far
+        self._tx_wake.set()
+
+    async def send_data(self, data: bytes) -> bool:
+        """Send bytes downstream in <=64KiB DATA frames, honouring the flow
+        window (unacked bytes) and the packet budget.  Returns False when the
+        stream or connection can no longer accept data."""
+        view = memoryview(data)
+        offset = 0
+        while offset < len(view):
+            end = min(offset + MAX_DATA_FRAME, len(view))
+            frame = bytes(view[offset:end])
+            if not await self._await_send_budget(len(frame)):
+                return False
+            if not self.conn.send_data_frame(self.stream_id, frame):
+                return False
+            self.tx_packets -= 1
+            self.tx_unacked_bytes += len(frame)
+            self.sent_packets += 1
+            self.sent_bytes += len(frame)
+            offset = end
+        return True
+
+    async def _await_send_budget(self, frame_len: int) -> bool:
+        stall_s = self.conn.config.continue_stall_s
+        started = time.monotonic()
+        while not self.is_finished:
+            window_ok = self.tx_unacked_bytes + frame_len <= self.conn.config.flow_window_bytes
+            if window_ok and self.tx_packets > 0:
+                return True
+            self._tx_wake.clear()
+            # close the wakeup race before parking
+            window_ok = self.tx_unacked_bytes + frame_len <= self.conn.config.flow_window_bytes
+            if (window_ok and self.tx_packets > 0) or self.is_finished:
+                continue
+            waited = time.monotonic() - started
+            if waited >= stall_s:
+                self.conn.log.warn(
+                    "stream_tx_stall_granted",
+                    stream=self.stream_id,
+                    waited_ms=int(waited * 1000),
+                    unacked=self.tx_unacked_bytes,
+                )
+                self.tx_packets = max(self.tx_packets, 1)
+                self.tx_unacked_bytes = 0
+                return True
+            try:
+                await asyncio.wait_for(self._tx_wake.wait(), timeout=min(0.5, stall_s - waited))
+            except asyncio.TimeoutError:
+                pass
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Wisp connection (one WebSocket)
+# ---------------------------------------------------------------------------
+
+
+class WispConnection:
+    """Per-WebSocket Wisp session: handshake detection, packet routing and
+    stream supervision."""
+
+    def __init__(
+        self,
+        server_ws: Any,
+        config: WispConfig,
+        pools: WispPools,
+        log: Logger,
+        conn_id: str,
+        subprotocol_offered: bool,
+    ) -> None:
+        self.ws = server_ws
+        self.config = config
+        self.pools = pools
+        self.log = log.bind(conn=conn_id)
+        self.conn_id = conn_id
+        self.subprotocol_offered = subprotocol_offered
+        self.wire: Optional[WireFormat] = None
+        self.streams: Dict[int, WispStream] = {}
+        self._rx: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue()
+        self._tasks: Set["asyncio.Task[None]"] = set()
+        self._proxies: List[Any] = []
+        self._closing = False
+        self._ws_closed = False
+        self._info_sent = False
+        self._v2_awaiting_client_info = False
+        self._streams_opened = 0
+        self._protocol_errors = 0
+        self._started = time.monotonic()
+
+    # -- setup ---------------------------------------------------------------
+    def attach(self) -> None:
+        """Accept the server socket and wire up the event listeners."""
+        self.ws.accept()
+        message_proxy = create_proxy(self._on_message)
+        close_proxy = create_proxy(self._on_close_event)
+        self._proxies = [message_proxy, close_proxy]
+        self.ws.addEventListener("message", message_proxy)
+        self.ws.addEventListener("close", close_proxy)
+
+    # -- JS callbacks (called between awaits on the same thread) ---------------
+    def _on_message(self, event: Any) -> None:
+        if self._closing:
+            return
+        try:
+            data = _ws_payload_to_bytes(getattr(event, "data", None))
+        except Exception as exc:  # noqa: BLE001
+            self.log.error("ws_binary_expected", error=repr(exc))
+            self.close_ws(1003)
+            return
+        self._rx.put_nowait(data)
+
+    def _on_close_event(self, _event: Any) -> None:
+        self._rx.put_nowait(None)
+
+    # -- main loop --------------------------------------------------------------
+    async def run(self) -> None:
+        try:
+            await self._handshake_phase()
+            while not self._closing:
+                item = await self._rx.get()
+                if item is None:
+                    break
+                if len(item) > MAX_FRAME_BYTES:
+                    self.log.warn("frame_too_large", size=len(item), limit=MAX_FRAME_BYTES)
+                    self.close_ws(1009)
+                    break
+                self._dispatch(item)  # WispProtocolError propagates to the handler below
+        except WispProtocolError as exc:
+            self._protocol_errors += 1
+            self.log.warn("protocol_error", detail=str(exc))
+            self.close_ws(1002)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - never let the task crash silently
+            self.log.error("connection_loop_crash", error=repr(exc))
+        finally:
+            await self._teardown()
+
+    # -- handshake / wire-format detection ----------------------------------------
+    async def _handshake_phase(self) -> None:
+        grace_s = max(0.0, self.config.greet_grace_ms / 1000.0)
+        item: Optional[bytes] = None
+        quiet = grace_s <= 0
+        if grace_s > 0:
+            try:
+                item = await asyncio.wait_for(self._rx.get(), timeout=grace_s)
+            except asyncio.TimeoutError:
+                quiet = True
+        if item is None:
+            if not quiet:
+                # The websocket closed while we were waiting for the client's
+                # first packet: shut down cleanly (never mistake the close
+                # sentinel for a quiet client - that would deadlock the queue).
+                self._closing = True
+                return
+            # Quiet client: no packet within the grace window.  Committing to
+            # v1.2 (or v2 when the client asked for a websocket subprotocol)
+            # is safe: classic clients send their CONNECT immediately and are
+            # detected inside the grace window.
+            if self.subprotocol_offered:
+                self._set_wire(WireFormat.V2)
+                self._send_info_server()
+                self._v2_awaiting_client_info = True
+            else:
+                self._set_wire(WireFormat.V12)
+                self._send_initial_continue()
+            item = await self._rx.get()
+            if item is None:
+                self._closing = True
+                return
+        self._classify_and_route(item)
+
+    def _classify_and_route(self, data: bytes) -> None:
+        if not data:
+            raise WispProtocolError("empty frame")
+        if len(data) > MAX_FRAME_BYTES:
+            self.log.warn("frame_too_large", size=len(data), limit=MAX_FRAME_BYTES)
+            self.close_ws(1009)
+            self._closing = True
+            return
+        ptype = data[0]
+        if ptype == _ClassicType.CONNECT:
+            if self.wire is not WireFormat.CLASSIC:
+                if self.wire is not None:
+                    self.log.warn("late_classic_client", previous=self.wire.value)
+                self._set_wire(WireFormat.CLASSIC)
+            self._dispatch(data)
+        elif ptype == _V12Type.CONNECT:
+            if self.wire is None:
+                self._set_wire(WireFormat.V12)
+                self._send_initial_continue()
+            elif self.wire is WireFormat.CLASSIC:
+                raise WispProtocolError("v1.2 CONNECT after classic framing")
+            self._dispatch(data)
+        elif ptype == _V12Type.INFO:
+            self._handle_v2_info(data)
+        elif ptype == _V12Type.CLOSE:
+            # v2 client rejected our handshake: close politely.
+            self.log.info("handshake_rejected_by_client")
+            self._closing = True
+        else:
+            raise WispProtocolError(f"unexpected leading packet type 0x{ptype:02x}")
+
+    def _handle_v2_info(self, data: bytes) -> None:
+        # Reaching here means the client's INFO packet has arrived (whether
+        # it initiated or is answering ours): reply with the server INFO (if
+        # not already sent) and finish the handshake with CONTINUE(0).
+        self._set_wire(WireFormat.V2)
+        if not self._info_sent:
+            self._send_info_server()
+        self._v2_awaiting_client_info = False
+        self._send_initial_continue()
+        self.log.debug("v2_handshake_complete", client_info_bytes=max(0, len(data) - 5))
+
+    def _set_wire(self, wire: WireFormat) -> None:
+        if self.wire is wire:
+            return
+        self.wire = wire
+        self.log.info("wire_format_selected", wire=wire.value)
+
+    # -- packet routing -----------------------------------------------------------
+    def _dispatch(self, data: bytes) -> None:
+        wire = self.wire
+        if wire is None:
+            raise WispProtocolError("dispatch before handshake")
+        packet = _parse_packet(wire, data)
+        if wire is WireFormat.CLASSIC:
+            if packet.ptype == _ClassicType.CONNECT:
+                self._handle_connect(packet)
+            elif packet.ptype == _ClassicType.DATA:
+                self._handle_data(packet)
+            elif packet.ptype == _ClassicType.CONTINUE:
+                self._handle_continue(packet, None)
+            elif packet.ptype == _ClassicType.CLOSE:
+                self._handle_close(packet)
+            else:
+                raise WispProtocolError(f"classic: unknown packet type 0x{packet.ptype:02x}")
+        else:
+            if packet.ptype == _V12Type.CONNECT:
+                self._handle_connect(packet)
+            elif packet.ptype == _V12Type.DATA:
+                self._handle_data(packet)
+            elif packet.ptype == _V12Type.CONTINUE:
+                self._handle_continue(packet, _parse_continue_credit(wire, packet.payload))
+            elif packet.ptype == _V12Type.CLOSE:
+                self._handle_close(packet)
+            elif packet.ptype == _V12Type.INFO:
+                self._handle_info_packet(packet)
+            else:
+                raise WispProtocolError(f"v1.2: unknown packet type 0x{packet.ptype:02x}")
+
+    def _handle_connect(self, packet: WispPacket) -> None:
+        wire = self.wire
+        assert wire is not None
+        if packet.stream_id == 0:
+            raise WispProtocolError("stream id 0 is reserved")
+        if packet.stream_id in self.streams:
+            self.log.warn("duplicate_stream_id", stream=packet.stream_id)
+            self.send_close(packet.stream_id, REASON_INVALID_INFO)
+            return
+        try:
+            request = _parse_connect(wire, packet.payload)
+        except InvalidConnectPayload as exc:
+            self.log.warn("invalid_connect", stream=packet.stream_id, detail=str(exc))
+            self.send_close(packet.stream_id, REASON_INVALID_INFO)
+            return
+        if request.protocol == STREAM_UDP:
+            self.log.info(
+                "udp_rejected",
+                stream=packet.stream_id,
+                host=request.hostname,
+                port=request.port,
+            )
+            self.send_close(packet.stream_id, REASON_BLOCKED)
+            return
+        stream = WispStream(self, packet.stream_id)
+        self.streams[packet.stream_id] = stream
+        self._streams_opened += 1
+        head = "http" if request.port in GET_HEAD_PORTS else "tcp"
+        self.log.info(
+            "stream_open",
+            stream=packet.stream_id,
+            head=head,
+            host=request.hostname,
+            port=request.port,
+        )
+        self._spawn(self._open_stream(stream, request.hostname, request.port, head))
+
+    def _handle_data(self, packet: WispPacket) -> None:
+        stream = self.streams.get(packet.stream_id)
+        if stream is None:
+            self.log.debug("data_for_unknown_stream", stream=packet.stream_id)
+            return
+        stream.feed(packet.payload)
+
+    def _handle_continue(self, packet: WispPacket, credit: Optional[int]) -> None:
+        stream = self.streams.get(packet.stream_id)
+        if stream is None:
+            self.log.debug("continue_for_unknown_stream", stream=packet.stream_id)
+            return
+        stream.notify_continue(credit)
+
+    def _handle_close(self, packet: WispPacket) -> None:
+        if packet.stream_id == 0:
+            self.log.info("handshake_rejected_by_client")
+            self._closing = True
+            return
+        stream = self.streams.get(packet.stream_id)
+        if stream is None:
+            self.log.debug("close_for_unknown_stream", stream=packet.stream_id)
+            return
+        self.log.info("stream_close_by_client", stream=packet.stream_id)
+        stream.mark_client_closed()
+
+    def _handle_info_packet(self, packet: WispPacket) -> None:
+        if self.wire is WireFormat.V2 and self._v2_awaiting_client_info:
+            self._v2_awaiting_client_info = False
+            self._send_initial_continue()
+            self.log.debug("v2_handshake_complete")
+        else:
+            self.log.debug("unexpected_info_packet", stream=packet.stream_id)
+
+    # -- outbound packets ------------------------------------------------------------
+    def _send_raw(self, payload: bytes) -> bool:
+        if self._closing:
+            return False
+        try:
+            self.ws.send(to_js(payload))
+            return True
+        except Exception as exc:  # noqa: BLE001 - peer may vanish at any time
+            self.log.debug("ws_send_failed", error=repr(exc))
+            self._closing = True
+            return False
+
+    def send_data_frame(self, stream_id: int, chunk: bytes) -> bool:
+        wire = self.wire or WireFormat.V12
+        ptype = _ClassicType.DATA if wire is WireFormat.CLASSIC else _V12Type.DATA
+        return self._send_raw(_encode_packet(wire, ptype, stream_id, chunk))
+
+    def send_continue(self, stream_id: int) -> bool:
+        wire = self.wire
+        if wire is None:
+            return False
+        if wire is WireFormat.CLASSIC:
+            payload = b""
+            ptype = _ClassicType.CONTINUE
+        else:
+            payload = SERVER_BUFFER_PACKETS.to_bytes(4, "little")
+            ptype = _V12Type.CONTINUE
+        return self._send_raw(_encode_packet(wire, ptype, stream_id, payload))
+
+    def _send_initial_continue(self) -> bool:
+        wire = self.wire
+        if wire is None or wire is WireFormat.CLASSIC:
+            return False
+        # v1.2/v2: CONTINUE on stream 0 announces the per-stream buffer size.
+        return self.send_continue(0)
+
+    def send_close(self, stream_id: int, reason: int) -> bool:
+        wire = self.wire
+        if wire is None:
+            return False
+        ptype = _ClassicType.CLOSE if wire is WireFormat.CLASSIC else _V12Type.CLOSE
+        return self._send_raw(_encode_packet(wire, ptype, stream_id, bytes((reason,))))
+
+    def _send_connect_ack(self, stream_id: int) -> bool:
+        # classic-only: CONNECT (0x00) with a single status byte, 0x00 = OK
+        return self._send_raw(_encode_packet(WireFormat.CLASSIC, _ClassicType.CONNECT, stream_id, b"\x00"))
+
+    def _send_info_server(self) -> bool:
+        # v2 INFO: version 2.1, no extensions (UDP is intentionally absent).
+        if self._info_sent:
+            return True
+        self._info_sent = True
+        payload = bytes((2, 1))
+        return self._send_raw(_encode_packet(WireFormat.V12, _V12Type.INFO, 0, payload))
+
+    # -- stream supervision ------------------------------------------------------------
+    def _spawn(self, coro: Coroutine[Any, Any, None]) -> "asyncio.Task[None]":
+        task = asyncio.ensure_future(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    async def _open_stream(self, stream: WispStream, host: str, port: int, head: str) -> None:
+        pool = self.pools.http if head == "http" else self.pools.tcp
+        try:
+            slot = await pool.acquire(
+                self.config.queue_limit, self.config.queue_timeout_s, self.log, stream.stream_id
+            )
+        except PoolQueueFullError as exc:
+            self.log.warn("stream_rejected_queue_full", stream=stream.stream_id, detail=str(exc))
+            self.send_close(stream.stream_id, REASON_THROTTLED)
+            self._drop_stream(stream)
+            return
+        except PoolAcquireTimeoutError as exc:
+            self.log.warn("stream_queue_timeout", stream=stream.stream_id, detail=str(exc))
+            self.send_close(stream.stream_id, REASON_CONNECT_TIMEOUT)
+            self._drop_stream(stream)
+            return
+        except asyncio.CancelledError:
+            self._drop_stream(stream)
+            raise
+        if stream.is_finished:
+            slot.release()
+            self._drop_stream(stream)
+            return
+        stream.attach_slot(slot)
+        try:
+            if head == "http":
+                await self._run_http_head(stream, host, port)
+            else:
+                await self._run_tcp_head(stream, host, port, b"")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - one stream must not kill others
+            self.log.error("stream_task_crash", stream=stream.stream_id, error=repr(exc))
+            self.send_close(stream.stream_id, REASON_UNSPECIFIED)
+        finally:
+            stream.dispose()
+            self._drop_stream(stream)
+
+    def _drop_stream(self, stream: WispStream) -> None:
+        existing = self.streams.pop(stream.stream_id, None)
+        if existing is not None:
+            self.log.info(
+                "stream_closed",
+                stream=stream.stream_id,
+                recv_packets=stream.recv_packets,
+                sent_packets=stream.sent_packets,
+                sent_bytes=stream.sent_bytes,
+                lifetime_ms=int((time.monotonic() - stream.created) * 1000),
+            )
+
+    # -- CONNECT head: raw TCP via cloudflare:sockets ------------------------------------
+    async def _run_tcp_head(self, stream: WispStream, host: str, port: int, initial: bytes) -> None:
+        sid = stream.stream_id
+        if _cf_connect is None:
+            self.log.error("tcp_head_unavailable", stream=sid)
+            self.send_close(sid, REASON_INVALID_INFO)
+            return
+        address = f"[{host}]:{port}" if ":" in host and not host.startswith("[") else f"{host}:{port}"
+        try:
+            socket = _cf_connect(address)
+        except Exception as exc:  # noqa: BLE001
+            self.log.warn("tcp_connect_failed", stream=sid, address=address, error=repr(exc))
+            self.send_close(sid, REASON_UNREACHABLE)
+            return
+        try:
+            await asyncio.wait_for(_await_js(socket.opened), timeout=self.config.connect_timeout_s)
+        except asyncio.TimeoutError:
+            self.log.warn("tcp_connect_timeout", stream=sid, address=address)
+            self.send_close(sid, REASON_CONNECT_TIMEOUT)
+            self._safe_socket_close(socket)
+            return
+        except asyncio.CancelledError:
+            self._safe_socket_close(socket)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.log.warn("tcp_connect_refused", stream=sid, address=address, error=repr(exc))
+            self.send_close(sid, REASON_REFUSED)
+            self._safe_socket_close(socket)
+            return
+        if self.wire is WireFormat.CLASSIC and self.config.classic_connect_ack:
+            self._send_connect_ack(sid)
+        self.log.debug("tcp_connected", stream=sid, address=address)
+
+        writer: Any = None
+        reader: Any = None
+        upstream: Optional["asyncio.Task[None]"] = None
+        downstream: Optional["asyncio.Task[None]"] = None
+        try:
+            writer = socket.writable.getWriter()
+            reader = socket.readable.getReader()
+            if initial:
+                # The fallback bytes must reach the target before anything
+                # the client queued behind them, so write before pumping.
+                await writer.write(to_js(initial))
+            upstream = self._spawn(self._pump_upstream(stream, writer))
+            downstream = self._spawn(self._pump_downstream(stream, reader, socket))
+            done, pending = await asyncio.wait(
+                {upstream, downstream}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                done_error = task.exception()
+                if done_error is not None:
+                    self.log.debug("pump_failed", stream=sid, error=repr(done_error))
+            if downstream in done and not stream.is_finished:
+                # target EOF: report a normal server-side close to the client
+                self.send_close(sid, REASON_VOLUNTARY)
+        except asyncio.CancelledError:
+            pending_tasks = [task for task in (upstream, downstream) if task is not None]
+            for task in pending_tasks:
+                task.cancel()
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+            raise
+        finally:
+            if writer is not None:
+                await self._safe_close_writer(writer)
+            self._safe_socket_close(socket)
+
+    async def _pump_upstream(self, stream: WispStream, writer: Any) -> None:
+        """Client DATA -> TCP socket; emits CONTINUE per consumed packet."""
+        while True:
+            chunk = await stream.inbound.get()
+            if chunk is None:
+                return
+            if not chunk:
+                continue
+            try:
+                await writer.write(to_js(chunk))
+            except Exception as exc:  # noqa: BLE001 - target gone
+                stream.conn.log.debug("tcp_write_failed", stream=stream.stream_id, error=repr(exc))
+                stream.finish_server()
+                return
+            self.send_continue(stream.stream_id)
+
+    async def _pump_downstream(self, stream: WispStream, reader: Any, socket: Any) -> None:
+        """TCP socket -> client DATA frames (flow-window gated)."""
+        while True:
+            try:
+                result = await reader.read()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - target gone
+                stream.conn.log.debug("tcp_read_failed", stream=stream.stream_id, error=repr(exc))
+                return
+            if stream.is_finished:
+                return
+            if bool(getattr(result, "done", False)):
+                return
+            value = getattr(result, "value", None)
+            if value is None:
+                return
+            data = _to_bytes(value)
+            if not data:
+                continue
+            if not await stream.send_data(data):
+                return
+
+    @staticmethod
+    async def _safe_close_writer(writer: Any) -> None:
+        close = getattr(writer, "close", None)
+        if not callable(close):
+            return
+        try:
+            result = close()
+        except Exception:  # noqa: BLE001
+            return
+        try:
+            if asyncio.iscoroutine(result):
+                await result
+            elif result is not None and hasattr(result, "then"):
+                await _await_js(result)
+        except (Exception, asyncio.CancelledError):  # noqa: BLE001 - teardown path
+            pass
+
+    @staticmethod
+    def _safe_socket_close(socket: Any) -> None:
+        try:
+            close = getattr(socket, "close", None)
+            if callable(close):
+                close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # -- GET head: delegate 80/443 traffic to fetch() --------------------------------------
+    async def _run_http_head(self, stream: WispStream, host: str, port: int) -> None:
+        sid = stream.stream_id
+        if self.wire is WireFormat.CLASSIC and self.config.classic_connect_ack:
+            self._send_connect_ack(sid)
+        parser = HttpRequestParser(MAX_HTTP_HEAD, MAX_HTTP_BODY)
+        fallback: Optional[bytes] = None
+        deadline = time.monotonic() + self.config.http_head_timeout_s
+        while not parser.complete:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.log.warn("http_head_timeout", stream=sid)
+                self.send_close(sid, REASON_TRANSFER_TIMEOUT)
+                return
+            try:
+                chunk = await stream.recv(timeout_s=remaining)
+            except asyncio.TimeoutError:
+                self.log.warn("http_head_timeout", stream=sid)
+                self.send_close(sid, REASON_TRANSFER_TIMEOUT)
+                return
+            if chunk is None:
+                self.log.debug("http_client_closed_early", stream=sid)
+                return
+            try:
+                parser.feed(chunk)
+            except TcpFallbackNeeded as need:
+                fallback = need.data
+                break
+            except HttpHeadTooLarge as exc:
+                self.log.warn("http_head_too_large", stream=sid, detail=str(exc))
+                self.send_close(sid, REASON_TRANSFER_TIMEOUT)
+                return
+            except ValueError as exc:
+                self.log.warn("http_malformed", stream=sid, detail=str(exc))
+                self.send_close(sid, REASON_TRANSFER_TIMEOUT)
+                return
+            if not parser.complete:
+                self.send_continue(sid)
+        if fallback is not None:
+            await self._fallback_to_tcp(stream, host, port, fallback)
+            return
+        request = parser.build()
+        self.log.info(
+            "http_request",
+            stream=sid,
+            method=request.method,
+            target=request.target,
+            host=host,
+            port=port,
+        )
+        try:
+            response = await self._issue_fetch(request, host, port)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - upstream/network failure
+            self.log.warn("fetch_failed", stream=sid, error=repr(exc))
+            await self._send_http_synthetic(stream, 502, "wisp-worker: upstream fetch failed")
+            return
+        try:
+            relayed = await self._relay_http_response(stream, request.method, response)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.log.warn("http_relay_failed", stream=sid, error=repr(exc))
+            return
+        if relayed and not stream.is_finished:
+            self.send_close(sid, REASON_VOLUNTARY)
+
+    async def _fallback_to_tcp(self, stream: WispStream, host: str, port: int, initial: bytes) -> None:
+        sid = stream.stream_id
+        self.log.info("http_fallback_tcp", stream=sid, host=host, port=port, bytes=len(initial))
+        if not self.config.allow_tcp_fallback:
+            self.send_close(sid, REASON_INVALID_INFO)
+            return
+        stream.release_slot()  # return the GET slot, then queue for a TCP slot
+        try:
+            slot = await self.pools.tcp.acquire(
+                self.config.queue_limit, self.config.queue_timeout_s, self.log, sid
+            )
+        except PoolQueueFullError:
+            self.send_close(sid, REASON_THROTTLED)
+            return
+        except PoolAcquireTimeoutError:
+            self.send_close(sid, REASON_CONNECT_TIMEOUT)
+            return
+        if stream.is_finished:
+            slot.release()
+            return
+        stream.attach_slot(slot)
+        await self._run_tcp_head(stream, host, port, initial)
+
+    async def _issue_fetch(self, request: HttpRequest, host: str, port: int) -> Any:
+        url = _build_fetch_url(request.target, host, port)
+        headers: Dict[str, str] = {}
+        for name, value in request.headers.items():
+            if name in _HOP_BY_HOP_REQUEST:
+                continue
+            headers[name] = value
+        init: Dict[str, Any] = {"method": request.method, "headers": headers}
+        if request.body:
+            init["body"] = request.body
+        self.log.debug("fetch_issue", url=url, method=request.method)
+        return await fetch(url, to_js(init, dict_converter=Object.fromEntries))
+
+    async def _relay_http_response(self, stream: WispStream, method: str, response: Any) -> bool:
+        status = int(getattr(response, "status", 502) or 502)
+        status_text = str(getattr(response, "statusText", "") or "")
+        if not status_text:
+            status_text = REASON_PHRASES.get(status, "Unknown")
+        headers = _js_headers_to_dict(getattr(response, "headers", None))
+        bodyless = status in (204, 304) or method == "HEAD"
+        has_length = "content-length" in headers
+        use_chunked = (not has_length) and (not bodyless)
+        lines: List[str] = [f"HTTP/1.1 {status} {status_text}"]
+        for name, value in headers.items():
+            if name in _HOP_BY_HOP_RESPONSE:
+                continue
+            if name == "content-length" and use_chunked:
+                continue
+            lines.append(f"{name}: {value}")
+        if use_chunked:
+            lines.append("Transfer-Encoding: chunked")
+        lines.append("Connection: close")
+        head = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8", "replace")
+        if not await stream.send_data(head):
+            return False
+        if bodyless:
+            return True
+        body = getattr(response, "body", None)
+        if body is None:
+            if use_chunked and not await stream.send_data(b"0\r\n\r\n"):
+                return False
+            return True
+        reader = body.getReader()
+        try:
+            while True:
+                result = await reader.read()
+                if bool(getattr(result, "done", False)):
+                    break
+                chunk_value = getattr(result, "value", None)
+                if chunk_value is None:
+                    break
+                data = _to_bytes(chunk_value)
+                if not data:
+                    continue
+                if use_chunked:
+                    data = _chunk_encode(data)
+                if not await stream.send_data(data):
+                    return False
+            if use_chunked and not await stream.send_data(b"0\r\n\r\n"):
+                return False
+            return True
+        finally:
+            try:
+                cancel = getattr(reader, "cancel", None)
+                if callable(cancel):
+                    cancel()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _send_http_synthetic(self, stream: WispStream, status: int, message: str) -> None:
+        body = (message + "\n").encode("utf-8")
+        head = (
+            f"HTTP/1.1 {status} {REASON_PHRASES.get(status, 'Unknown')}\r\n"
+            f"Content-Type: text/plain; charset=utf-8\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode("utf-8")
+        await stream.send_data(head + body)
+
+    # -- teardown ----------------------------------------------------------------------------
+    def close_ws(self, code: int = 1000) -> None:
+        """Close the underlying websocket; idempotent at the socket level."""
+        if self._ws_closed:
+            return
+        self._ws_closed = True
+        self._closing = True
+        try:
+            self.ws.close(code)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _teardown(self) -> None:
+        self._closing = True
+        for stream in list(self.streams.values()):
+            stream.mark_client_closed()
+            stream.finish_server()
+        for task in list(self._tasks):
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        for stream in list(self.streams.values()):
+            stream.dispose()
+        self.streams.clear()
+        self.close_ws(1000)
+        for proxy in self._proxies:
+            destroy = getattr(proxy, "destroy", None)
+            if callable(destroy):
+                try:
+                    destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._proxies.clear()
+        self.log.info(
+            "connection_closed",
+            streams=self._streams_opened,
+            protocol_errors=self._protocol_errors,
+            duration_ms=int((time.monotonic() - self._started) * 1000),
+        )
+
+
+# ---------------------------------------------------------------------------
+# HTTP surface: status document, CORS, 404
+# ---------------------------------------------------------------------------
+
+
+def _json_response(payload: Dict[str, Any], status: int = 200) -> Any:
+    body = json.dumps(payload, indent=2, default=str)
+    headers = {
+        "content-type": "application/json; charset=utf-8",
+        "access-control-allow-origin": "*",
+        "access-control-allow-headers": "*",
+        "access-control-allow-methods": "GET, HEAD, OPTIONS",
+    }
+    init: Dict[str, Any] = {"status": status, "headers": headers}
+    return Response.new(body, to_js(init, dict_converter=Object.fromEntries))
+
+
+def _status_document(request_url: str, pools: WispPools) -> Dict[str, Any]:
+    parsed = urlparse(request_url)
+    host = parsed.netloc or "your-worker.workers.dev"
+    return {
+        "status": "ok",
+        "service": "wisp-worker",
+        "endpoint": f"wss://{host}/",
+        "protocol": {
+            "wisp": ["v1-classic", "v1.2", "v2"],
+            "udp": "disabled",
+            "extensions": [],
+        },
+        "limits": {
+            "tcp_slots": MAX_TCP_SLOTS,
+            "http_slots": MAX_HTTP_SLOTS,
+            "total_in_flight": MAX_TCP_SLOTS + MAX_HTTP_SLOTS,
+            "queue": "bounded FIFO per pool",
+        },
+        "pools": pools.snapshot(),
+        "note": (
+            "Secure WebSocket only: clients loaded from HTTPS pages/service "
+            "workers must use wss:// (ws:// is blocked as mixed content)."
+        ),
+    }
+
+
+def _handle_plain_http(request: Any, config: WispConfig, log: Logger, pools: WispPools) -> Any:
+    method = str(getattr(request, "method", "GET") or "GET").upper()
+    url = str(getattr(request, "url", "/") or "/")
+    path = urlparse(url).path or "/"
+    if method == "OPTIONS":
+        return _json_response({"status": "ok"}, status=204)
+    if method in ("GET", "HEAD") and path in ("/", "/wisp/", "/health", "/status"):
+        log.info("status_request", path=path, method=method)
+        return _json_response(_status_document(url, pools))
+    if path in ("/", "/wisp/", "/health", "/status"):
+        return _json_response({"error": "method not allowed", "method": method}, status=405)
+    return _json_response({"error": "not found", "path": path}, status=404)
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+
+
+async def _handle_fetch(request: Any, env: Any, ctx: Any) -> Any:
+    config = WispConfig.from_env(env)
+    log = Logger(config.log_level)
+    try:
+        headers = getattr(request, "headers", None)
+        upgrade = ""
+        if headers is not None:
+            try:
+                upgrade = str(headers.get("Upgrade") or "").strip().lower()
+            except Exception:  # noqa: BLE001
+                upgrade = ""
+    except Exception:  # noqa: BLE001
+        upgrade = ""
+    if upgrade == "websocket":
+        return _accept_websocket(request, ctx, config, log)
+    return _handle_plain_http(request, config, log, _POOLS)
+
+
+def _accept_websocket(request: Any, ctx: Any, config: WispConfig, log: Logger) -> Any:
+    pair = WebSocketPair.new()
+    parts = pair.to_py() if hasattr(pair, "to_py") else list(pair)
+    server_ws = parts[1]
+    server_ws.accept()
+    offered = ""
+    headers = getattr(request, "headers", None)
+    if headers is not None:
+        try:
+            offered = str(headers.get("sec-websocket-protocol") or "").strip()
+        except Exception:  # noqa: BLE001
+            offered = ""
+    conn_id = uuid.uuid4().hex[:8]
+    conn_log = log.bind(conn=conn_id)
+    conn_log.info("websocket_accepted")
+    connection = WispConnection(
+        server_ws=server_ws,
+        config=config,
+        pools=_POOLS,
+        log=log,
+        conn_id=conn_id,
+        subprotocol_offered=bool(offered),
+    )
+    connection.attach()
+    _spawn_background(ctx, connection.run(), conn_log)
+    init: Dict[str, Any] = {"status": 101, "webSocket": server_ws}
+    if offered:
+        # Echo the first offered subprotocol (some clients require it).
+        init["headers"] = {"sec-websocket-protocol": offered.split(",")[0].strip()}
+    return Response.new(None, to_js(init, dict_converter=Object.fromEntries))
+
+
+if WorkerEntrypoint is not None:
+
+    class Default(WorkerEntrypoint):
+        """New-style Python Workers entrypoint (workers-runtime-sdk)."""
+
+        async def fetch(self, request: Any) -> Any:
+            return await _handle_fetch(
+                request, getattr(self, "env", None), getattr(self, "ctx", None)
+            )
+
+else:
+
+    async def on_fetch(request: Any, env: Any, ctx: Any) -> Any:
+        """Old-style module handler (older compatibility dates)."""
+        return await _handle_fetch(request, env, ctx)
