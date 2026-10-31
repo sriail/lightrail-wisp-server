@@ -1,19 +1,24 @@
-name = "lightrail-wisp-server"
-main = "src/worker.py"
+name = "wisp-workers-py"
+main = "worker.py"
+compatibility_date = "2026-08-01"
+compatibility_flags = ["python_workers", "disable_python_external_sdk"]
 
-compatibility_date = "2026-04-20"
-compatibility_flags = ["python_workers"]
-[python_modules]
-exclude = ["**/*.pyc", "**/__pycache__"]
+# Optional tuning (all have safe defaults in worker.py)
+# [vars]
+# WISP_LOG_LEVEL = "info"            # debug | info | warning | error
+# WISP_PASSWORD = "letmein"          # require /<password>/ in the wisp URL path
+# WISP_BUFFER_SIZE = "128"           # per-stream packet buffer (CONTINUE pacing)
+# WISP_CONNECT_TIMEOUT = "15"        # seconds; exceeding closes with 0x43
+# WISP_QUEUE_TIMEOUT = "30"          # seconds waiting for an outbound slot (0x49)
+# WISP_MAX_STREAMS = "64"            # per websocket session (0x49 beyond)
+# WISP_MAX_HTTP_BODY = "8388608"     # max buffered HTTP request body, bytes
+# WISP_HTTP_HEAD_PORTS = "80,443"    # destinations delegated to the fetch head
+# WISP_ALLOWED_HOST_REGEX = ".*"     # destination hostnames must match (0x48)
 
-## Enables Logs and Traces (optional, you can disable)
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 [observability.logs]
 enabled = true
-head_sampling_rate = 1
 invocation_logs = true
-persist = true
-
-[observability.traces]
-enabled = true
-head_sampling_rate = 1
-persist = true
