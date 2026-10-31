@@ -3,13 +3,33 @@
 A single-file Wisp protocol server that runs on the Workers runtime via
 Pyodide.  It implements the task's *dual-head architecture*:
 
-  * **GET head**  - TCP streams destined for ports 80/443 are delegated to
-    HTTP requests issued through the Workers ``fetch()`` API.  The client's
-    plain-HTTP request is parsed off the Wisp stream, re-issued upstream and
-    the response is synthesised back onto the stream.  (TLS-shaped traffic
-    on 443 is detected and transparently falls back to the TCP head.)
-  * **CONNECT head** - every other TCP stream is relayed through the
-    ``connect()`` API from ``cloudflare:sockets`` (bridged by sockets.mjs).
+  * **GET head**  - TCP streams destined for plaintext-HTTP ports (port 80 by
+    default, ``WISP_HTTP_HEAD_PORTS``) are delegated to HTTP requests issued
+    through the Workers ``fetch()`` API.  The client's plain-HTTP request is
+    parsed off the Wisp stream, re-issued upstream and the response is
+    synthesised back onto the stream.  Bytes that are not plain HTTP (e.g. a
+    TLS ClientHello, or an ``Upgrade:`` request) are transparently re-routed
+    to the TCP head.
+  * **CONNECT head** - every other TCP stream - **including port 443** - is
+    relayed through the ``connect()`` API from ``cloudflare:sockets``
+    (bridged by sockets.mjs).  Scramjet/Epoxy performs *client-side* TLS
+    (rustls) on 443 streams and writes the handshake bytes straight into the
+    Wisp stream, so 443 must be a transparent TCP tunnel: ``fetch()`` can
+    neither carry nor answer those bytes.  ``connect()`` with the default
+    ``secureTransport: "off"`` provides exactly such a raw socket (the
+    runtime performs no automatic TLS upgrade on 443).
+
+Wisp v1/v1.2 flow control is direction-asymmetric, exactly like the
+reference servers (wisp-server-python and wisp-server-workers):
+
+  * client -> server DATA is paced by **server-sent CONTINUE** packets that
+    announce the server's per-stream receive buffer (``SERVER_BUFFER_PACKETS``
+    packets); the server re-announces as it consumes queue items;
+  * server -> client DATA is **not gated** on any client acknowledgement -
+    the protocol defines no client->server CONTINUE.  (Epoxy 2.1.20 never
+    sends one; gating on it stalls a tunnel after a handful of frames.)
+    Memory is protected by per-stream inbound byte caps, optional
+    ``bufferedAmount`` gating (``WISP_TX_BUFFER_GATE``) and idle watchdogs.
 
 Concurrency is governed by two global (per-isolate) pools with a hard limit
 of 3 live TCP sockets and 3 in-flight GET/HTTP requests - six in-flight
@@ -140,17 +160,24 @@ REASON_THROTTLED = 0x49
 
 MAX_TCP_SLOTS = 3          # live TCP sockets via the CONNECT API (hard limit)
 MAX_HTTP_SLOTS = 3         # in-flight GET/HTTP requests (hard limit)
-GET_HEAD_PORTS = frozenset((80, 443))
+DEFAULT_HTTP_HEAD_PORTS = frozenset((80,))
+# Port 443 is intentionally NOT on the GET head: Scramjet/Epoxy does
+# client-side TLS over a raw TCP tunnel for https:// URLs (verified on the
+# wire: the first DATA frame on a 443 stream is a TLS ClientHello), and
+# fetch() cannot transport TLS handshake bytes.
 
 MAX_FRAME_BYTES = 1 << 20  # largest accepted wisp packet (1 MiB)
 MAX_DATA_FRAME = 65536     # largest DATA frame we send downstream
 MAX_HTTP_HEAD = 16 * 1024  # request head cap for the GET head
 MAX_HTTP_BODY = 10 << 20   # request body cap for the GET head
 INBOUND_QUEUE_LIMIT = 256  # buffered client DATA packets per stream
-SERVER_BUFFER_PACKETS = 64 # receive buffer announced to v1.2/v2 clients
-INITIAL_TX_PACKETS = 8     # optimistic send budget before first CONTINUE
-TX_PACKET_CAP = 512
-DEFAULT_FLOW_WINDOW_BYTES = 262144
+DEFAULT_INBOUND_MAX_BYTES = 16 << 20  # per-stream inbound byte cap
+SERVER_BUFFER_PACKETS = 64 # receive buffer announced to clients
+DEFAULT_TX_HIGH_WATER_BYTES = 1 << 20  # bufferedAmount gate threshold
+DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000
+DEFAULT_HTTP_BODY_IDLE_TIMEOUT_MS = 30_000
+DEFAULT_HTTP_FETCH_TIMEOUT_MS = 30_000
+DEFAULT_HTTP_CLOSE_LINGER_MS = 350
 
 _HOP_BY_HOP_REQUEST = frozenset(
     (
@@ -274,6 +301,28 @@ def _env_bool(env: Any, name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_ports(env: Any, name: str, default: frozenset) -> frozenset:
+    """Parse a comma-separated port list (``WISP_HTTP_HEAD_PORTS``)."""
+    raw = _env_get(env, name)
+    if raw is None or not raw.strip():
+        return default
+    ports = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            port = int(token)
+        except ValueError:
+            console.warn(f"[wisp] invalid port {token!r} in {name}; using default")
+            return default
+        if not 1 <= port <= 65535:
+            console.warn(f"[wisp] port {port} out of range in {name}; using default")
+            return default
+        ports.add(port)
+    return frozenset(ports) if ports else default
+
+
 @dataclass(frozen=True)
 class WispConfig:
     """Runtime configuration (all values have safe defaults)."""
@@ -283,8 +332,14 @@ class WispConfig:
     queue_timeout_ms: int = 15000
     connect_timeout_ms: int = 10000
     http_head_timeout_ms: int = 10000
-    flow_window_bytes: int = DEFAULT_FLOW_WINDOW_BYTES
-    continue_stall_ms: int = 30000
+    http_head_ports: frozenset = DEFAULT_HTTP_HEAD_PORTS
+    http_fetch_timeout_ms: int = DEFAULT_HTTP_FETCH_TIMEOUT_MS
+    http_body_idle_timeout_ms: int = DEFAULT_HTTP_BODY_IDLE_TIMEOUT_MS
+    http_close_linger_ms: int = DEFAULT_HTTP_CLOSE_LINGER_MS
+    stream_idle_timeout_ms: int = DEFAULT_STREAM_IDLE_TIMEOUT_MS
+    inbound_max_bytes: int = DEFAULT_INBOUND_MAX_BYTES
+    tx_buffer_gate: bool = False
+    tx_high_water_bytes: int = DEFAULT_TX_HIGH_WATER_BYTES
     greet_grace_ms: int = 250
     allow_tcp_fallback: bool = True
     classic_connect_ack: bool = True
@@ -300,10 +355,38 @@ class WispConfig:
             queue_timeout_ms=_env_int(env, "WISP_QUEUE_TIMEOUT_MS", 15000, 100, 600000),
             connect_timeout_ms=_env_int(env, "WISP_CONNECT_TIMEOUT_MS", 10000, 100, 600000),
             http_head_timeout_ms=_env_int(env, "WISP_HTTP_HEAD_TIMEOUT_MS", 10000, 100, 600000),
-            flow_window_bytes=_env_int(
-                env, "WISP_FLOW_WINDOW_BYTES", DEFAULT_FLOW_WINDOW_BYTES, 4096, 1 << 24
+            http_head_ports=_env_ports(env, "WISP_HTTP_HEAD_PORTS", DEFAULT_HTTP_HEAD_PORTS),
+            http_fetch_timeout_ms=_env_int(
+                env, "WISP_HTTP_FETCH_TIMEOUT_MS", DEFAULT_HTTP_FETCH_TIMEOUT_MS, 100, 600000
             ),
-            continue_stall_ms=_env_int(env, "WISP_CONTINUE_STALL_MS", 30000, 500, 600000),
+            http_body_idle_timeout_ms=_env_int(
+                env,
+                "WISP_HTTP_BODY_IDLE_TIMEOUT_MS",
+                DEFAULT_HTTP_BODY_IDLE_TIMEOUT_MS,
+                100,
+                600000,
+            ),
+            http_close_linger_ms=_env_int(
+                env, "WISP_HTTP_CLOSE_LINGER_MS", DEFAULT_HTTP_CLOSE_LINGER_MS, 0, 10_000
+            ),
+            stream_idle_timeout_ms=_env_int(
+                env,
+                "WISP_STREAM_IDLE_TIMEOUT_MS",
+                DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+                1000,
+                86_400_000,
+            ),
+            inbound_max_bytes=_env_int(
+                env, "WISP_INBOUND_MAX_BYTES", DEFAULT_INBOUND_MAX_BYTES, 1024, 1 << 28
+            ),
+            tx_buffer_gate=_env_bool(env, "WISP_TX_BUFFER_GATE", False),
+            tx_high_water_bytes=_env_int(
+                env,
+                "WISP_TX_HIGH_WATER_BYTES",
+                DEFAULT_TX_HIGH_WATER_BYTES,
+                1 << 16,
+                1 << 26,
+            ),
             greet_grace_ms=_env_int(env, "WISP_GREET_GRACE_MS", 250, 0, 5000),
             allow_tcp_fallback=_env_bool(env, "WISP_ALLOW_TCP_FALLBACK", True),
             classic_connect_ack=_env_bool(env, "WISP_CLASSIC_CONNECT_ACK", True),
@@ -322,8 +405,20 @@ class WispConfig:
         return self.http_head_timeout_ms / 1000.0
 
     @property
-    def continue_stall_s(self) -> float:
-        return self.continue_stall_ms / 1000.0
+    def http_fetch_timeout_s(self) -> float:
+        return self.http_fetch_timeout_ms / 1000.0
+
+    @property
+    def http_body_idle_s(self) -> float:
+        return self.http_body_idle_timeout_ms / 1000.0
+
+    @property
+    def http_close_linger_s(self) -> float:
+        return self.http_close_linger_ms / 1000.0
+
+    @property
+    def stream_idle_timeout_s(self) -> float:
+        return self.stream_idle_timeout_ms / 1000.0
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +880,14 @@ class HttpRequestParser:
         self._chunked = False
         self._chunk_size: Optional[int] = None
         self._chunk_final = False
+        # Every byte fed to the parser, kept (bounded) so an Upgrade request
+        # can be reconstructed byte-for-byte when re-routed to the TCP head.
+        self._fed = bytearray()
+
+    @property
+    def raw_request(self) -> bytes:
+        """Exact bytes fed so far (head + body), for transparent re-routing."""
+        return bytes(self._fed)
 
     # -- public API ---------------------------------------------------------
     @property
@@ -802,6 +905,9 @@ class HttpRequestParser:
         return bytes(self._buf) + bytes(self._body)
 
     def feed(self, chunk: bytes) -> None:
+        if len(self._fed) + len(chunk) > self._max_head + self._max_body + 4096:
+            raise HttpHeadTooLarge("request exceeds head+body cap")
+        self._fed.extend(chunk)
         if self._head is None:
             if not self._buf and chunk and not _looks_like_http(chunk):
                 raise TcpFallbackNeeded(bytes(chunk))
@@ -972,19 +1078,32 @@ def _build_fetch_url(target: str, host: str, port: int) -> str:
 
 
 class WispStream:
-    """One multiplexed Wisp stream (client-side initiated TCP connection)."""
+    """One multiplexed Wisp stream (client-side initiated TCP connection).
+
+    Flow control follows the protocol (and the reference servers) exactly:
+
+    * client -> server DATA is buffered in ``inbound`` (bounded by
+      ``INBOUND_QUEUE_LIMIT`` packets and ``inbound_max_bytes`` bytes) and
+      paced by server-sent CONTINUE announcements;
+    * server -> client DATA is sent immediately in <=64KiB frames - the wisp
+      v1/v1.2 protocol defines no client->server CONTINUE, so no client
+      acknowledgement may ever gate the transmit side (epoxy 2.1.20 never
+      sends one).  Memory safety comes from the inbound caps, the optional
+      ``bufferedAmount`` gate and the idle watchdogs instead.
+    """
 
     def __init__(self, conn: "WispConnection", stream_id: int) -> None:
         self.conn = conn
         self.stream_id = stream_id
         self.inbound: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue()
+        self.inbound_bytes = 0
         self.slot: Optional[PoolSlot] = None
-        self.tx_packets = INITIAL_TX_PACKETS
-        self.tx_unacked_bytes = 0
+        self.connect_acked = False
         self.recv_packets = 0
         self.sent_packets = 0
         self.sent_bytes = 0
-        self._tx_wake = asyncio.Event()
+        self.acked_packets = 0   # client CONTINUEs observed (informational)
+        self.continues_sent = 0  # window announcements towards the client
         self._client_closed = False
         self._server_closed = False
         self._disposed = False
@@ -1007,14 +1126,12 @@ class WispStream:
 
     def finish_server(self) -> None:
         self._server_closed = True
-        self._tx_wake.set()
 
     def dispose(self) -> None:
-        """Idempotent teardown: wake pumps and release the pool slot once."""
+        """Idempotent teardown: release the pool slot exactly once."""
         if self._disposed:
             return
         self._disposed = True
-        self._tx_wake.set()
         self.release_slot()
 
     def release_slot(self) -> None:
@@ -1029,16 +1146,21 @@ class WispStream:
     def feed(self, payload: bytes) -> None:
         if self.is_finished:
             return
-        if self.inbound.qsize() >= INBOUND_QUEUE_LIMIT:
+        if self.inbound.qsize() >= INBOUND_QUEUE_LIMIT or (
+            self.inbound_bytes + len(payload) > self.conn.config.inbound_max_bytes
+        ):
             self.conn.log.warn(
-                "stream_throttled",
+                "wisp_stream_stalled",
                 stream=self.stream_id,
-                buffered=self.inbound.qsize(),
+                reason="inbound_overflow",
+                buffered_packets=self.inbound.qsize(),
+                buffered_bytes=self.inbound_bytes,
             )
             self.conn.send_close(self.stream_id, REASON_THROTTLED)
             self.finish_server()
             return
         self.recv_packets += 1
+        self.inbound_bytes += len(payload)
         self.inbound.put_nowait(payload)
 
     async def recv(self, timeout_s: Optional[float] = None) -> Optional[bytes]:
@@ -1049,67 +1171,51 @@ class WispStream:
             if timeout_s <= 0:
                 raise asyncio.TimeoutError()
             item = await asyncio.wait_for(self.inbound.get(), timeout_s)
+        if item is not None:
+            self.inbound_bytes -= len(item)
         return item
 
-    # -- server -> client ------------------------------------------------------
-    def notify_continue(self, credit: Optional[int]) -> None:
-        if self.is_finished:
-            return
-        if credit is None:  # classic CONTINUE: one more packet may be sent
-            self.tx_packets = min(self.tx_packets + 1, TX_PACKET_CAP)
-        elif credit > 0:  # v1.2/v2: announced buffer-remaining
-            self.tx_packets = min(max(self.tx_packets, credit), TX_PACKET_CAP)
-        self.tx_unacked_bytes = 0  # client consumed everything sent so far
-        self._tx_wake.set()
+    def note_consumed(self) -> None:
+        """Call after one queued packet was consumed and forwarded: re-announce
+        the receive window to keep the client sending (spec: 'the server
+        should regularly send CONTINUE packets before the buffer fills)."""
+        self.conn.send_continue(self.stream_id)
 
+    def note_client_continue(self, credit: Optional[int]) -> None:
+        """A client -> server CONTINUE was observed.  The wisp v1/v1.2
+        protocols never define this direction, so it must not gate the
+        transmit side; it is recorded for diagnostics only."""
+        self.acked_packets += 1
+
+    # -- server -> client ------------------------------------------------------
     async def send_data(self, data: bytes) -> bool:
-        """Send bytes downstream in <=64KiB DATA frames, honouring the flow
-        window (unacked bytes) and the packet budget.  Returns False when the
-        stream or connection can no longer accept data."""
+        """Send bytes downstream in <=64KiB DATA frames.  Returns False when
+        the stream or connection can no longer accept data."""
         view = memoryview(data)
         offset = 0
         while offset < len(view):
+            if self.is_finished or self.conn.closing:
+                return False
             end = min(offset + MAX_DATA_FRAME, len(view))
             frame = bytes(view[offset:end])
-            if not await self._await_send_budget(len(frame)):
+            self.conn.log.debug(
+                "wisp_frame_queued", stream=self.stream_id, bytes=len(frame), sent_total=self.sent_bytes
+            )
+            if not await self.conn.await_tx_room(len(frame), self.stream_id):
                 return False
             if not self.conn.send_data_frame(self.stream_id, frame):
                 return False
-            self.tx_packets -= 1
-            self.tx_unacked_bytes += len(frame)
             self.sent_packets += 1
             self.sent_bytes += len(frame)
+            self.conn.log.debug(
+                "wisp_frame_sent",
+                stream=self.stream_id,
+                bytes=len(frame),
+                sent_packets=self.sent_packets,
+                sent_bytes=self.sent_bytes,
+            )
             offset = end
         return True
-
-    async def _await_send_budget(self, frame_len: int) -> bool:
-        stall_s = self.conn.config.continue_stall_s
-        started = time.monotonic()
-        while not self.is_finished:
-            window_ok = self.tx_unacked_bytes + frame_len <= self.conn.config.flow_window_bytes
-            if window_ok and self.tx_packets > 0:
-                return True
-            self._tx_wake.clear()
-            # close the wakeup race before parking
-            window_ok = self.tx_unacked_bytes + frame_len <= self.conn.config.flow_window_bytes
-            if (window_ok and self.tx_packets > 0) or self.is_finished:
-                continue
-            waited = time.monotonic() - started
-            if waited >= stall_s:
-                self.conn.log.warn(
-                    "stream_tx_stall_granted",
-                    stream=self.stream_id,
-                    waited_ms=int(waited * 1000),
-                    unacked=self.tx_unacked_bytes,
-                )
-                self.tx_packets = max(self.tx_packets, 1)
-                self.tx_unacked_bytes = 0
-                return True
-            try:
-                await asyncio.wait_for(self._tx_wake.wait(), timeout=min(0.5, stall_s - waited))
-            except asyncio.TimeoutError:
-                pass
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1150,6 +1256,11 @@ class WispConnection:
         self._started = time.monotonic()
 
     # -- setup ---------------------------------------------------------------
+    @property
+    def closing(self) -> bool:
+        """True once the websocket session is winding down."""
+        return self._closing
+
     def attach(self) -> None:
         """Prepare the server socket and wire up the event listeners.
 
@@ -1369,7 +1480,7 @@ class WispConnection:
         stream = WispStream(self, packet.stream_id)
         self.streams[packet.stream_id] = stream
         self._streams_opened += 1
-        head = "http" if request.port in GET_HEAD_PORTS else "tcp"
+        head = "http" if request.port in self.config.http_head_ports else "tcp"
         self.log.info(
             "stream_open",
             stream=packet.stream_id,
@@ -1391,7 +1502,16 @@ class WispConnection:
         if stream is None:
             self.log.debug("continue_for_unknown_stream", stream=packet.stream_id)
             return
-        stream.notify_continue(credit)
+        # Client -> server CONTINUE does not exist in wisp v1/v1.2 (the
+        # direction is server -> client only); accept it tolerantly and
+        # record it for diagnostics.  It must never gate the tx side.
+        stream.note_client_continue(credit)
+        self.log.debug(
+            "wisp_ack_received",
+            stream=packet.stream_id,
+            credit=credit if credit is not None else -1,
+            total=stream.acked_packets,
+        )
 
     def _handle_close(self, packet: WispPacket) -> None:
         if packet.stream_id == 0:
@@ -1425,6 +1545,61 @@ class WispConnection:
             self._closing = True
             return False
 
+    def _ws_buffered_amount(self) -> Optional[int]:
+        """Pending send-buffer bytes if the runtime exposes ``bufferedAmount``."""
+        try:
+            value = getattr(self.ws, "bufferedAmount", None)
+        except Exception:  # noqa: BLE001
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        buffered = int(value)
+        return buffered if buffered >= 0 else None
+
+    async def await_tx_room(self, incoming: int, stream_id: int) -> bool:
+        """Optional transmit gate on the runtime's WebSocket send buffer.
+
+        Off by default (``WISP_TX_BUFFER_GATE``): server -> client DATA is
+        sent ungated, exactly like the reference wisp servers, and workerd
+        applies TCP-level backpressure towards the client itself.  When
+        enabled, a frame waits until ``bufferedAmount`` drops below the high
+        water mark; a wedged client is eventually failed with 0x47 instead
+        of buffering without bound.
+        """
+        if not self.config.tx_buffer_gate:
+            return True
+        high_water = self.config.tx_high_water_bytes
+        waited = 0.0
+        last_report = -1.0
+        while not self._closing:
+            buffered = self._ws_buffered_amount()
+            if buffered is None or buffered + incoming <= high_water:
+                return True
+            now = time.monotonic()
+            if now - last_report >= 1.0:
+                self.log.warn(
+                    "wisp_stream_stalled",
+                    stream=stream_id,
+                    reason="tx_buffer_full",
+                    buffered=buffered,
+                    high_water=high_water,
+                    waited_ms=int(waited * 1000),
+                )
+                last_report = now
+            if waited >= self.config.stream_idle_timeout_s:
+                self.log.warn(
+                    "wisp_stream_stalled",
+                    stream=stream_id,
+                    reason="tx_buffer_stuck",
+                    buffered=buffered,
+                    waited_ms=int(waited * 1000),
+                )
+                self.send_close(stream_id, REASON_TRANSFER_TIMEOUT)
+                return False
+            await asyncio.sleep(min(0.05, max(0.01, self.config.stream_idle_timeout_s - waited)))
+            waited += 0.05
+        return False
+
     def send_data_frame(self, stream_id: int, chunk: bytes) -> bool:
         wire = self.wire or WireFormat.V12
         ptype = _ClassicType.DATA if wire is WireFormat.CLASSIC else _V12Type.DATA
@@ -1437,10 +1612,22 @@ class WispConnection:
         if wire is WireFormat.CLASSIC:
             payload = b""
             ptype = _ClassicType.CONTINUE
+            buffer_remaining = SERVER_BUFFER_PACKETS
         else:
-            payload = SERVER_BUFFER_PACKETS.to_bytes(4, "little")
+            buffer_remaining = SERVER_BUFFER_PACKETS
+            payload = buffer_remaining.to_bytes(4, "little")
             ptype = _V12Type.CONTINUE
-        return self._send_raw(_encode_packet(wire, ptype, stream_id, payload))
+        sent = self._send_raw(_encode_packet(wire, ptype, stream_id, payload))
+        if sent and stream_id in self.streams:
+            stream = self.streams[stream_id]
+            stream.continues_sent += 1
+            self.log.debug(
+                "wisp_window_updated",
+                stream=stream_id,
+                buffer_remaining=buffer_remaining,
+                announcements=stream.continues_sent,
+            )
+        return sent
 
     def _send_initial_continue(self) -> bool:
         wire = self.wire
@@ -1459,6 +1646,15 @@ class WispConnection:
     def _send_connect_ack(self, stream_id: int) -> bool:
         # classic-only: CONNECT (0x00) with a single status byte, 0x00 = OK
         return self._send_raw(_encode_packet(WireFormat.CLASSIC, _ClassicType.CONNECT, stream_id, b"\x00"))
+
+    def _maybe_send_connect_ack(self, stream: WispStream) -> None:
+        """Classic-wire CONNECT acknowledgment, exactly once per stream (the
+        fallback path re-enters the TCP head and must not double-ack)."""
+        if stream.connect_acked:
+            return
+        if self.wire is WireFormat.CLASSIC and self.config.classic_connect_ack:
+            stream.connect_acked = True
+            self._send_connect_ack(stream.stream_id)
 
     def _send_info_server(self) -> bool:
         # v2 INFO: version 2.1, no extensions (UDP is intentionally absent).
@@ -1513,15 +1709,17 @@ class WispConnection:
             stream.dispose()
             self._drop_stream(stream)
 
-    def _drop_stream(self, stream: WispStream) -> None:
+    def _drop_stream(self, stream: WispStream, reason: Optional[int] = None) -> None:
         existing = self.streams.pop(stream.stream_id, None)
         if existing is not None:
             self.log.info(
-                "stream_closed",
+                "wisp_stream_closed",
                 stream=stream.stream_id,
+                reason=f"0x{reason:02x}" if reason is not None else None,
                 recv_packets=stream.recv_packets,
                 sent_packets=stream.sent_packets,
                 sent_bytes=stream.sent_bytes,
+                acked_packets=stream.acked_packets,
                 lifetime_ms=int((time.monotonic() - stream.created) * 1000),
             )
 
@@ -1554,8 +1752,7 @@ class WispConnection:
             self.send_close(sid, REASON_REFUSED)
             self._safe_socket_close(socket)
             return
-        if self.wire is WireFormat.CLASSIC and self.config.classic_connect_ack:
-            self._send_connect_ack(sid)
+        self._maybe_send_connect_ack(stream)
         self.log.debug("tcp_connected", stream=sid, address=address)
 
         writer: Any = None
@@ -1570,7 +1767,7 @@ class WispConnection:
                 # the client queued behind them, so write before pumping.
                 await writer.write(to_js(initial))
             upstream = self._spawn(self._pump_upstream(stream, writer))
-            downstream = self._spawn(self._pump_downstream(stream, reader, socket))
+            downstream = self._spawn(self._pump_downstream(stream, reader))
             done, pending = await asyncio.wait(
                 {upstream, downstream}, return_when=asyncio.FIRST_COMPLETED
             )
@@ -1579,7 +1776,13 @@ class WispConnection:
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
             for task in done:
-                done_error = task.exception()
+                if task.cancelled():
+                    continue
+                done_error = None
+                try:
+                    done_error = task.exception()
+                except Exception:  # noqa: BLE001
+                    done_error = None
                 if done_error is not None:
                     self.log.debug("pump_failed", stream=sid, error=repr(done_error))
             if downstream in done and not stream.is_finished:
@@ -1598,8 +1801,22 @@ class WispConnection:
 
     async def _pump_upstream(self, stream: WispStream, writer: Any) -> None:
         """Client DATA -> TCP socket; emits CONTINUE per consumed packet."""
+        idle_s = self.config.stream_idle_timeout_s
         while True:
-            chunk = await stream.inbound.get()
+            try:
+                chunk = await stream.recv(timeout_s=idle_s)
+            except asyncio.TimeoutError:
+                if stream.is_finished:
+                    return
+                self.log.warn(
+                    "wisp_stream_stalled",
+                    stream=stream.stream_id,
+                    reason="upstream_idle",
+                    waited_ms=self.config.stream_idle_timeout_ms,
+                )
+                self.send_close(stream.stream_id, REASON_TRANSFER_TIMEOUT)
+                stream.finish_server()
+                return
             if chunk is None:
                 return
             if not chunk:
@@ -1610,13 +1827,29 @@ class WispConnection:
                 stream.conn.log.debug("tcp_write_failed", stream=stream.stream_id, error=repr(exc))
                 stream.finish_server()
                 return
-            self.send_continue(stream.stream_id)
+            stream.note_consumed()
 
-    async def _pump_downstream(self, stream: WispStream, reader: Any, socket: Any) -> None:
-        """TCP socket -> client DATA frames (flow-window gated)."""
+    async def _pump_downstream(self, stream: WispStream, reader: Any) -> None:
+        """TCP socket -> client DATA frames.  Ungated by design: wisp v1/v1.2
+        define no client->server CONTINUE, so no client acknowledgement may
+        ever gate the transmit side (epoxy never sends one; gating here is
+        what stalled tunnels after a handful of frames)."""
+        idle_s = self.config.stream_idle_timeout_s
         while True:
             try:
-                result = await reader.read()
+                result = await asyncio.wait_for(_await_js(reader.read()), timeout=idle_s)
+            except asyncio.TimeoutError:
+                if stream.is_finished:
+                    return
+                self.log.warn(
+                    "wisp_stream_stalled",
+                    stream=stream.stream_id,
+                    reason="downstream_idle",
+                    waited_ms=self.config.stream_idle_timeout_ms,
+                )
+                self.send_close(stream.stream_id, REASON_TRANSFER_TIMEOUT)
+                stream.finish_server()
+                return
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - target gone
@@ -1661,13 +1894,13 @@ class WispConnection:
         except Exception:  # noqa: BLE001
             pass
 
-    # -- GET head: delegate 80/443 traffic to fetch() --------------------------------------
+    # -- GET head: delegate plaintext-HTTP ports (default: 80) to fetch() ------------------
     async def _run_http_head(self, stream: WispStream, host: str, port: int) -> None:
         sid = stream.stream_id
-        if self.wire is WireFormat.CLASSIC and self.config.classic_connect_ack:
-            self._send_connect_ack(sid)
+        self._maybe_send_connect_ack(stream)
         parser = HttpRequestParser(MAX_HTTP_HEAD, MAX_HTTP_BODY)
         fallback: Optional[bytes] = None
+        fallback_reason = "non_http_bytes"
         deadline = time.monotonic() + self.config.http_head_timeout_s
         while not parser.complete:
             remaining = deadline - time.monotonic()
@@ -1699,39 +1932,98 @@ class WispConnection:
                 return
             if not parser.complete:
                 self.send_continue(sid)
+        if fallback is None:
+            request = parser.build()
+            # A request that wants a protocol upgrade (e.g. a WebSocket
+            # handshake riding on port 80) cannot be served by fetch(): relay
+            # the original bytes verbatim through a raw TCP tunnel instead.
+            wants_upgrade = "upgrade" in request.headers or "upgrade" in (
+                request.headers.get("connection", "").lower()
+            )
+            if wants_upgrade:
+                fallback = parser.raw_request
+                fallback_reason = "upgrade_request"
         if fallback is not None:
-            await self._fallback_to_tcp(stream, host, port, fallback)
+            await self._fallback_to_tcp(stream, host, port, fallback, fallback_reason)
             return
-        request = parser.build()
+        # target may carry a query string with secrets: log path only
+        logged_target = request.target.split("?", 1)[0]
         self.log.info(
-            "http_request",
+            "http_request_started",
             stream=sid,
             method=request.method,
-            target=request.target,
+            target=logged_target,
             host=host,
             port=port,
         )
         try:
-            response = await self._issue_fetch(request, host, port)
+            response = await asyncio.wait_for(
+                self._issue_fetch(request, host, port),
+                timeout=self.config.http_fetch_timeout_s,
+            )
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            self.log.warn(
+                "http_request_failed",
+                stream=sid,
+                host=host,
+                port=port,
+                error=f"fetch timeout after {self.config.http_fetch_timeout_ms}ms",
+            )
+            await self._send_http_synthetic(stream, 504, "wisp-worker: upstream fetch timed out")
+            return
         except Exception as exc:  # noqa: BLE001 - upstream/network failure
-            self.log.warn("fetch_failed", stream=sid, error=repr(exc))
+            self.log.warn("http_request_failed", stream=sid, host=host, port=port, error=repr(exc))
             await self._send_http_synthetic(stream, 502, "wisp-worker: upstream fetch failed")
             return
+        self.log.info("http_request_completed", stream=sid, status=int(getattr(response, "status", 0)))
+        relayed = False
         try:
             relayed = await self._relay_http_response(stream, request.method, response)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
             self.log.warn("http_relay_failed", stream=sid, error=repr(exc))
+            self.send_close(sid, REASON_NETWORK_ERROR)
             return
         if relayed and not stream.is_finished:
-            self.send_close(sid, REASON_VOLUNTARY)
+            await self._close_http_stream(stream)
 
-    async def _fallback_to_tcp(self, stream: WispStream, host: str, port: int, initial: bytes) -> None:
+    async def _close_http_stream(self, stream: WispStream) -> None:
+        """End a completed GET-head exchange.
+
+        The client announced ``Connection: close`` in our synthesized head, so
+        a well-behaved client tears the stream down itself.  Give it a short
+        linger window to do so before we send ours: epoxy's wasm client races
+        its wisp CLOSE handling against hyper draining the buffered response
+        frames, and an immediate CLOSE after the terminal chunk can truncate
+        the body read on its side (observed as "unexpected EOF during chunk
+        size line" / "connection closed before message complete")."""
         sid = stream.stream_id
-        self.log.info("http_fallback_tcp", stream=sid, host=host, port=port, bytes=len(initial))
+        linger_s = self.config.http_close_linger_s
+        if linger_s > 0:
+            try:
+                item = await asyncio.wait_for(stream.inbound.get(), timeout=linger_s)
+            except asyncio.TimeoutError:
+                item = "linger-expired"
+            if item is None:
+                # the client closed the stream itself: nothing to announce
+                return
+        self.send_close(sid, REASON_VOLUNTARY)
+
+    async def _fallback_to_tcp(
+        self, stream: WispStream, host: str, port: int, initial: bytes, reason: str
+    ) -> None:
+        sid = stream.stream_id
+        self.log.info(
+            "http_fallback_tcp",
+            stream=sid,
+            host=host,
+            port=port,
+            bytes=len(initial),
+            reason=reason,
+        )
         if not self.config.allow_tcp_fallback:
             self.send_close(sid, REASON_INVALID_INFO)
             return
@@ -1759,45 +2051,89 @@ class WispConnection:
             if name in _HOP_BY_HOP_REQUEST:
                 continue
             headers[name] = value
-        init: Dict[str, Any] = {"method": request.method, "headers": headers}
+        # Never negotiate a compressed upstream body: workerd's fetch()
+        # transparently decompresses gzip/br/deflate responses but can leave
+        # the (now false) Content-Encoding header in place, which makes the
+        # client try to decode plain bytes ("brotli error").  Identity keeps
+        # the relayed headers and body exact by construction.
+        headers["accept-encoding"] = "identity"
+        init: Dict[str, Any] = {
+            "method": request.method,
+            "headers": headers,
+            # Transparent-proxy semantics: return the origin's redirect to
+            # the client (epoxy implements its own redirect handling) rather
+            # than transparently following it here.
+            "redirect": "manual",
+        }
         if request.body:
             init["body"] = request.body
         self.log.debug("fetch_issue", url=url, method=request.method)
         return await fetch(url, to_js(init, dict_converter=Object.fromEntries))
 
     async def _relay_http_response(self, stream: WispStream, method: str, response: Any) -> bool:
+        """Relay a fetch() response onto the wisp stream.
+
+        Framing: bodied responses are ALWAYS re-framed as chunked.  The
+        origin's Content-Length is stripped, which makes a length mismatch
+        (e.g. a runtime body transformation) impossible by construction and
+        therefore eliminates the "bytes remaining on stream" class of client
+        errors.  End-of-stream is signalled explicitly with the terminal
+        ``0\\r\\n\\r\\n`` chunk, and binary bytes pass through verbatim.
+        """
+        sid = stream.stream_id
         status = int(getattr(response, "status", 502) or 502)
         status_text = str(getattr(response, "statusText", "") or "")
         if not status_text:
             status_text = REASON_PHRASES.get(status, "Unknown")
         headers = _js_headers_to_dict(getattr(response, "headers", None))
         bodyless = status in (204, 304) or method == "HEAD"
-        has_length = "content-length" in headers
-        use_chunked = (not has_length) and (not bodyless)
         lines: List[str] = [f"HTTP/1.1 {status} {status_text}"]
         for name, value in headers.items():
             if name in _HOP_BY_HOP_RESPONSE:
                 continue
-            if name == "content-length" and use_chunked:
-                continue
+            if name == "content-length":
+                continue  # chunked re-framing: announce no length ourselves
             lines.append(f"{name}: {value}")
-        if use_chunked:
+        if not bodyless:
             lines.append("Transfer-Encoding: chunked")
         lines.append("Connection: close")
         head = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8", "replace")
+        self.log.info(
+            "http_response_received",
+            stream=sid,
+            status=status,
+            headers=len(headers),
+            bodyless=bodyless,
+        )
         if not await stream.send_data(head):
             return False
         if bodyless:
+            self.log.info("http_response_body_complete", stream=sid, bytes=0, chunks=0)
             return True
         body = getattr(response, "body", None)
         if body is None:
-            if use_chunked and not await stream.send_data(b"0\r\n\r\n"):
+            if not await stream.send_data(b"0\r\n\r\n"):
                 return False
+            self.log.info("http_response_body_complete", stream=sid, bytes=0, chunks=0)
             return True
         reader = body.getReader()
+        forwarded = 0
+        chunks = 0
         try:
             while True:
-                result = await reader.read()
+                try:
+                    result = await asyncio.wait_for(
+                        _await_js(reader.read()), timeout=self.config.http_body_idle_s
+                    )
+                except asyncio.TimeoutError:
+                    self.log.warn(
+                        "http_response_body_timeout",
+                        stream=sid,
+                        forwarded=forwarded,
+                        idle_ms=self.config.http_body_idle_timeout_ms,
+                    )
+                    self.send_close(sid, REASON_TRANSFER_TIMEOUT)
+                    return False
                 if bool(getattr(result, "done", False)):
                     break
                 chunk_value = getattr(result, "value", None)
@@ -1806,12 +2142,22 @@ class WispConnection:
                 data = _to_bytes(chunk_value)
                 if not data:
                     continue
-                if use_chunked:
-                    data = _chunk_encode(data)
-                if not await stream.send_data(data):
+                forwarded += len(data)
+                chunks += 1
+                self.log.debug(
+                    "http_response_body_chunk",
+                    stream=sid,
+                    bytes=len(data),
+                    forwarded=forwarded,
+                    chunk=chunks,
+                )
+                if not await stream.send_data(_chunk_encode(data)):
                     return False
-            if use_chunked and not await stream.send_data(b"0\r\n\r\n"):
+            if not await stream.send_data(b"0\r\n\r\n"):
                 return False
+            self.log.info(
+                "http_response_body_complete", stream=sid, bytes=forwarded, chunks=chunks
+            )
             return True
         finally:
             try:
@@ -1889,7 +2235,7 @@ def _json_response(payload: Dict[str, Any], status: int = 200) -> Any:
     return Response.new(body, to_js(init, dict_converter=Object.fromEntries))
 
 
-def _status_document(request_url: str, pools: WispPools) -> Dict[str, Any]:
+def _status_document(request_url: str, pools: WispPools, config: WispConfig) -> Dict[str, Any]:
     parsed = urlparse(request_url)
     host = parsed.netloc or "your-worker.workers.dev"
     return {
@@ -1903,7 +2249,12 @@ def _status_document(request_url: str, pools: WispPools) -> Dict[str, Any]:
         },
         "transport": {
             "tcp_head": "cloudflare:sockets" if _cf_connect is not None else "unavailable",
-            "http_head_ports": sorted(GET_HEAD_PORTS),
+            "http_head_ports": sorted(config.http_head_ports),
+            "port_443": "raw TCP tunnel (client-side TLS; connect() with secureTransport off)",
+            "flow_control": {
+                "client_to_server": f"CONTINUE pacing, buffer {SERVER_BUFFER_PACKETS} packets",
+                "server_to_client": "ungated (protocol defines no client ack)",
+            },
         },
         "limits": {
             "tcp_slots": MAX_TCP_SLOTS,
@@ -1927,7 +2278,7 @@ def _handle_plain_http(request: Any, config: WispConfig, log: Logger, pools: Wis
         return _json_response({"status": "ok"}, status=204)
     if method in ("GET", "HEAD") and path in ("/", "/wisp/", "/health", "/status"):
         log.info("status_request", path=path, method=method)
-        return _json_response(_status_document(url, pools))
+        return _json_response(_status_document(url, pools, config))
     if path in ("/", "/wisp/", "/health", "/status"):
         return _json_response({"error": "method not allowed", "method": method}, status=405)
     return _json_response({"error": "not found", "path": path}, status=404)
