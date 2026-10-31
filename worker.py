@@ -53,10 +53,42 @@ from urllib.parse import urlparse
 from js import Object, Promise, Response, WebSocketPair, console, fetch
 from pyodide.ffi import create_proxy, to_js
 
-try:  # sockets.mjs re-exports cloudflare:sockets for the Python side
-    from sockets import connect as _cf_connect
-except ImportError:  # pragma: no cover - TCP head disabled, GET head still works
-    _cf_connect = None  # type: ignore[assignment]
+
+def _resolve_cf_connect() -> Any:
+    """Locate the Cloudflare TCP ``connect()`` API for the CONNECT head.
+
+    Two supported routes, tried in order:
+
+    1. ``import_from_javascript("cloudflare:sockets")`` - the built-in
+       runtime SDK route.  workerd pre-imports ``cloudflare:sockets``, so
+       this works with no extra wrangler configuration.
+    2. ``from sockets import connect`` - the ``sockets.mjs`` ES-module
+       bridge, bundled when wrangler.toml carries an ``[[rules]]`` block
+       with ``type = "ESModule"`` and ``globs = ["**/*.mjs"]``.
+
+    Returns ``None`` when neither is importable: the TCP head is then
+    disabled and only ports 80/443 (the fetch head) can be served.
+    """
+    try:
+        from workers import import_from_javascript
+
+        return import_from_javascript("cloudflare:sockets").connect
+    except Exception:  # noqa: BLE001 - fall through to the .mjs bridge
+        pass
+    try:
+        from sockets import connect
+
+        return connect
+    except Exception:  # noqa: BLE001 - TCP head disabled, GET head still works
+        return None
+
+
+_cf_connect = _resolve_cf_connect()
+if _cf_connect is None:  # pragma: no cover - depends on the deployment bundle
+    console.warn(
+        "[wisp] cloudflare:sockets is not importable: the TCP head is "
+        "disabled and only ports 80/443 (fetch head) will be served"
+    )
 
 try:  # new-style entrypoint (workers-runtime-sdk)
     from workers import WorkerEntrypoint
@@ -489,6 +521,61 @@ def _js_headers_to_dict(headers: Any) -> Dict[str, str]:
     return result
 
 
+def _wisp_pair_endpoints(pair: Any) -> Tuple[Any, Any]:
+    """Extract ``(client, server)`` from a workerd ``WebSocketPair`` result.
+
+    ``new WebSocketPair()`` returns a plain JS object with two *named
+    instance* properties ("0" = client, "1" = server) - it is NOT a JS
+    Array (workerd ``src/workerd/api/web-socket.h`` registers them via
+    ``JSG_READONLY_INSTANCE_PROPERTY(0/1)``; there is even a TODO there
+    wishing they were indexed properties).  Pyodide therefore hands
+    Python a ``JsProxy`` that:
+
+      * is **not subscriptable** (``pair[1]`` raises ``TypeError`` - the
+        production crash),
+      * is not ``len()``-able,
+      * and whose ``to_py()`` returns the *same proxy*, because Pyodide
+        only converts Array/Map/Set/typed arrays, never plain objects
+        (which is why ``pair.to_py()[1]`` crashed too).
+
+    The documented extraction is ``Object.values()``; Pyodide exposes it
+    as ``JsProxy.object_values()``.  Both return a JS Array proxy whose
+    elements stay ``JsProxy`` (verified live on Pyodide 0.28.3, the
+    version behind compatibility date 2026-08-01 / Python 3.13).
+    """
+    values: Any = None
+    object_values = getattr(pair, "object_values", None)
+    if callable(object_values):
+        try:
+            values = object_values()
+        except Exception:  # noqa: BLE001 - fall through to Object.values
+            values = None
+    if values is None:
+        try:
+            values = Object.values(pair)
+        except Exception:  # noqa: BLE001
+            values = None
+    if values is not None and isinstance(values, (str, bytes, bytearray)):
+        values = None  # a list-like container of two sockets is required
+    if values is not None:
+        try:
+            client, server = values[0], values[1]
+            if client is not None and server is not None:
+                return client, server
+        except (TypeError, KeyError, IndexError):
+            pass
+        try:
+            items = list(values)
+            if len(items) == 2 and items[0] is not None and items[1] is not None:
+                return items[0], items[1]
+        except (TypeError, ValueError):
+            pass
+    raise TypeError(
+        "WebSocketPair did not expose two endpoints via object_values()/"
+        f"Object.values() (got {type(pair).__name__})"
+    )
+
+
 def _spawn_background(ctx: Any, coro: Coroutine[Any, Any, None], log: Logger) -> None:
     """Run a coroutine past the request lifetime via ctx.waitUntil."""
     task = asyncio.ensure_future(coro)
@@ -498,12 +585,18 @@ def _spawn_background(ctx: Any, coro: Coroutine[Any, Any, None], log: Logger) ->
 
     def _executor(resolve: Any, _reject: Any) -> None:
         def _done(completed: "asyncio.Task[None]") -> None:
-            try:
-                exc = completed.exception()
-            except Exception:  # noqa: BLE001
+            # CancelledError derives from BaseException, so a cancelled
+            # task must be screened off before touching .exception();
+            # otherwise every cancelled session logs a spurious
+            # "Exception in callback" traceback into the event loop.
+            if not completed.cancelled():
                 exc = None
-            if exc is not None:
-                log.error("background_task_failed", error=repr(exc))
+                try:
+                    exc = completed.exception()
+                except Exception:  # noqa: BLE001
+                    exc = None
+                if exc is not None:
+                    log.error("background_task_failed", error=repr(exc))
             try:
                 resolve(None)
             except Exception:  # noqa: BLE001
@@ -511,10 +604,21 @@ def _spawn_background(ctx: Any, coro: Coroutine[Any, Any, None], log: Logger) ->
 
         task.add_done_callback(_done)
 
+    # Promise.new() invokes the executor synchronously (JS semantics), so
+    # the PyProxy can be released as soon as the call returns; keeping it
+    # alive would leak one PyProxy per WebSocket session.
+    executor_proxy = create_proxy(_executor)
     try:
-        wait_until(Promise.new(create_proxy(_executor)))
+        wait_until(Promise.new(executor_proxy))
     except Exception:  # noqa: BLE001 - the task keeps running regardless
         pass
+    finally:
+        destroy = getattr(executor_proxy, "destroy", None)
+        if callable(destroy):
+            try:
+                destroy()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1047,13 +1151,28 @@ class WispConnection:
 
     # -- setup ---------------------------------------------------------------
     def attach(self) -> None:
-        """Accept the server socket and wire up the event listeners."""
+        """Prepare the server socket and wire up the event listeners.
+
+        ``binaryType`` must be assigned *before* ``accept()``: on
+        compatibility dates >= 2026-03-17 the
+        ``websocket_standard_binary_type`` flag is on by default, binary
+        frames are delivered as ``Blob`` objects and this server cannot
+        parse them.  Assigning ``"arraybuffer"`` first guarantees
+        ``ArrayBuffer`` delivery for every frame (the Workers runtime
+        docs prescribe exactly this ordering).
+        """
+        try:
+            self.ws.binaryType = "arraybuffer"
+        except Exception:  # noqa: BLE001 - older runtimes may reject it
+            self.log.debug("ws_binary_type_assign_failed")
         self.ws.accept()
         message_proxy = create_proxy(self._on_message)
         close_proxy = create_proxy(self._on_close_event)
-        self._proxies = [message_proxy, close_proxy]
+        error_proxy = create_proxy(self._on_error_event)
+        self._proxies = [message_proxy, close_proxy, error_proxy]
         self.ws.addEventListener("message", message_proxy)
         self.ws.addEventListener("close", close_proxy)
+        self.ws.addEventListener("error", error_proxy)
 
     # -- JS callbacks (called between awaits on the same thread) ---------------
     def _on_message(self, event: Any) -> None:
@@ -1062,12 +1181,28 @@ class WispConnection:
         try:
             data = _ws_payload_to_bytes(getattr(event, "data", None))
         except Exception as exc:  # noqa: BLE001
-            self.log.error("ws_binary_expected", error=repr(exc))
+            self.log.error(
+                "ws_binary_expected",
+                error=repr(exc),
+                hint="binaryType must be 'arraybuffer' for binary frames",
+            )
             self.close_ws(1003)
             return
         self._rx.put_nowait(data)
 
     def _on_close_event(self, _event: Any) -> None:
+        self._rx.put_nowait(None)
+
+    def _on_error_event(self, event: Any) -> None:
+        """Socket errors must not pass silently: log and end the session."""
+        detail = ""
+        try:
+            detail = str(
+                getattr(event, "message", None) or getattr(event, "type", "") or ""
+            )
+        except Exception:  # noqa: BLE001
+            detail = ""
+        self.log.warn("ws_error_event", detail=detail[:200])
         self._rx.put_nowait(None)
 
     # -- main loop --------------------------------------------------------------
@@ -1766,6 +1901,10 @@ def _status_document(request_url: str, pools: WispPools) -> Dict[str, Any]:
             "udp": "disabled",
             "extensions": [],
         },
+        "transport": {
+            "tcp_head": "cloudflare:sockets" if _cf_connect is not None else "unavailable",
+            "http_head_ports": sorted(GET_HEAD_PORTS),
+        },
         "limits": {
             "tcp_slots": MAX_TCP_SLOTS,
             "http_slots": MAX_HTTP_SLOTS,
@@ -1818,10 +1957,11 @@ async def _handle_fetch(request: Any, env: Any, ctx: Any) -> Any:
 
 
 def _accept_websocket(request: Any, ctx: Any, config: WispConfig, log: Logger) -> Any:
-    pair = WebSocketPair.new()
-    parts = pair.to_py() if hasattr(pair, "to_py") else list(pair)
-    server_ws = parts[1]
-    server_ws.accept()
+    # workerd's WebSocketPair is a plain JS object {0: client, 1: server};
+    # Pyodide wraps it in a JsProxy that is not subscriptable and whose
+    # to_py() returns it unchanged, so the endpoints must be extracted via
+    # object_values()/Object.values() (see _wisp_pair_endpoints).
+    client_ws, server_ws = _wisp_pair_endpoints(WebSocketPair.new())
     offered = ""
     headers = getattr(request, "headers", None)
     if headers is not None:
@@ -1831,7 +1971,6 @@ def _accept_websocket(request: Any, ctx: Any, config: WispConfig, log: Logger) -
             offered = ""
     conn_id = uuid.uuid4().hex[:8]
     conn_log = log.bind(conn=conn_id)
-    conn_log.info("websocket_accepted")
     connection = WispConnection(
         server_ws=server_ws,
         config=config,
@@ -1840,9 +1979,21 @@ def _accept_websocket(request: Any, ctx: Any, config: WispConfig, log: Logger) -
         conn_id=conn_id,
         subprotocol_offered=bool(offered),
     )
+    # attach() assigns binaryType, accepts the server socket exactly once
+    # and registers the message/close/error listeners BEFORE the 101 goes
+    # out, so no frame can arrive unhandled.
     connection.attach()
     _spawn_background(ctx, connection.run(), conn_log)
-    init: Dict[str, Any] = {"status": 101, "webSocket": server_ws}
+    conn_log.info(
+        "websocket_accepted",
+        tcp_head=_cf_connect is not None,
+        subprotocol=offered.split(",")[0].strip() if offered else "",
+    )
+    # The 101 response MUST carry the *client* end of the pair: workerd
+    # rejects a Response whose socket was already accept()ed ("Can't
+    # return WebSocket in a Response after calling accept()."), and the
+    # server end is the one this worker drives.
+    init: Dict[str, Any] = {"status": 101, "webSocket": client_ws}
     if offered:
         # Echo the first offered subprotocol (some clients require it).
         init["headers"] = {"sec-websocket-protocol": offered.split(",")[0].strip()}
