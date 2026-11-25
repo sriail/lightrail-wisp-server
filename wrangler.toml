@@ -1,0 +1,50 @@
+name = "lightrail-wisp-server"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-11-01"
+workers_dev = true
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+
+[observability]
+enabled = true
+
+[vars]
+PATH_PREFIX        = ""
+# slots and queue
+HEAD_SLOTS         = "4"
+TCP_SLOTS          = "2"
+QUEUE_MAX          = "64"
+QUEUE_WAIT_MS      = "10000"
+MAX_OPEN_STREAMS   = "64"
+SUBREQUEST_MAX     = "45"
+# session
+BUFFER_SIZE        = "128"
+SESSION_MAX_MS     = "30000"
+STREAM_IDLE_MS     = "15000"
+CONNECT_TIMEOUT_MS = "8000"
+BATCH_IDLE_MS      = "350"
+BATCH_MAX_MS       = "10000"
+BATCH_MAX_BYTES    = "8388608"
+MAX_REQUEST_BYTES  = "4194304"
+# egress hub
+STREAM_OUT_CAP     = "1048576"
+EGRESS_CAP         = "8388608"
+# HTTP lane
+HTTP_LANE_PORTS    = "80,443"
+HTTP_LANE_METHODS  = "GET,HEAD"
+HTTP_HEAD_MAX      = "65536"
+LANE_FALLBACK      = "tcp"
+# heads
+HEAD_MAX_BYTES     = "33554432"
+HEAD_TIMEOUT_MS    = "15000"
+RANGE_MAX          = "8388608"
+BATCH_URLS_MAX     = "16"
+MAX_REDIRECTS      = "5"
+PARALLEL_RANGES    = "false"
+SPLIT_THRESHOLD    = "4194304"
+SPLIT_CHUNK        = "2097152"
+# policy
+ALLOW_ORIGIN       = "*"
+ALLOW_HOSTS        = ""
+BLOCK_HOSTS        = ""
