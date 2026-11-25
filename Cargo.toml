@@ -2,7 +2,7 @@
 name = "lightrail-wisp-server"
 version = "1.2.0"
 edition = "2021"
-description = "Wisp v1.2 HTTP-profile server for Cloudflare Workers (TCP-only, queued, HTTP lane, GET heads) Developed By Sriail"
+description = "Wisp v1.2 HTTP-profile server for Cloudflare Workers (TCP-only, queued, HTTP lane, GET heads)"
 license = "MIT"
 
 [lib]
