@@ -2,9 +2,8 @@ name = "lightrail-wisp-server"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-11-01"
 workers_dev = true
-
 [build]
-command = "cargo install -q worker-build && worker-build --release"
+command = "command -v cargo >/dev/null 2>&1 || (curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.100.0 --profile minimal) && . \"$HOME/.cargo/env\" && rustup target add wasm32-unknown-unknown && (command -v worker-build >/dev/null 2>&1 || cargo install -q --locked worker-build) && worker-build --release"
 
 [observability]
 enabled = true
