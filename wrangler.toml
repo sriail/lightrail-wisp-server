@@ -1,15 +1,17 @@
-name = "lightrail-wisp-server"
+name = "wisp-rs"
 main = "build/worker/shim.mjs"
-compatibility_date = "2026-11-01"
+compatibility_date = "2024-11-01"
 workers_dev = true
+
 [build]
-command = "command -v cargo >/dev/null 2>&1 || (curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.100.0 --profile minimal) && . \"$HOME/.cargo/env\" && rustup target add wasm32-unknown-unknown && (command -v worker-build >/dev/null 2>&1 || cargo install -q --locked worker-build) && worker-build --release"
+command = "cargo install -q worker-build@0.1.14 && worker-build --release"
 
 [observability]
 enabled = true
 
 [vars]
-PATH_PREFIX        = ""
+WISP_PATH          = "/wisp/"
+ALLOWED_ORIGINS    = ""            # comma list; empty = any
 # slots and queue
 HEAD_SLOTS         = "4"
 TCP_SLOTS          = "2"
@@ -17,33 +19,32 @@ QUEUE_MAX          = "64"
 QUEUE_WAIT_MS      = "10000"
 MAX_OPEN_STREAMS   = "64"
 SUBREQUEST_MAX     = "45"
-# session
+ROTATE_ON_BUDGET   = "true"
+DRAIN_MS           = "5000"
+# session and packets
 BUFFER_SIZE        = "128"
-SESSION_MAX_MS     = "30000"
+MAX_FRAME_BYTES    = "1048576"
+DATA_CHUNK         = "16384"
+SESSION_MAX_MS     = "0"           # 0 = unlimited
 STREAM_IDLE_MS     = "15000"
+STREAM_MAX_MS      = "60000"
 CONNECT_TIMEOUT_MS = "8000"
-BATCH_IDLE_MS      = "350"
-BATCH_MAX_MS       = "10000"
-BATCH_MAX_BYTES    = "8388608"
-MAX_REQUEST_BYTES  = "4194304"
 # egress hub
 STREAM_OUT_CAP     = "1048576"
-EGRESS_CAP         = "8388608"
+EGRESS_CAP        = "8388608"
+EGRESS_RATE_BPS    = "0"           # 0 = off
+STREAM_MAX_BYTES   = "0"           # 0 = off
 # HTTP lane
 HTTP_LANE_PORTS    = "80,443"
 HTTP_LANE_METHODS  = "GET,HEAD"
 HTTP_HEAD_MAX      = "65536"
-LANE_FALLBACK      = "tcp"
-# heads
+MAX_BODY_BYTES     = "1048576"
 HEAD_MAX_BYTES     = "33554432"
 HEAD_TIMEOUT_MS    = "15000"
-RANGE_MAX          = "8388608"
-BATCH_URLS_MAX     = "16"
-MAX_REDIRECTS      = "5"
+LANE_FALLBACK      = "tcp"
 PARALLEL_RANGES    = "false"
 SPLIT_THRESHOLD    = "4194304"
 SPLIT_CHUNK        = "2097152"
 # policy
-ALLOW_ORIGIN       = "*"
 ALLOW_HOSTS        = ""
 BLOCK_HOSTS        = ""
