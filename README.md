@@ -12,7 +12,7 @@
 
 Because Cloudflare Workers enforce strict per-invocation limits (such as a maximum of 6 simultaneous outbound connections, subrequest caps, and no raw UDP sockets), standard Wisp servers fail under real-world concurrency. **wisp-rs** solves this by splitting traffic into smart execution lanes, transparently queueing excess connections instead of dropping them, and managing subrequest budgets gracefully.
 
-### Key Architectural Adaptations
+### Architectural Adaptations Compared to Alternative Projects
 * **WSS-Only Inbound:** Accepts connections strictly over WebSocket over TLS (`wss://`).
 * **Dual-Lane Routing:** 
   * **HTTP Lane (Ports 80 & 443):** Intercepts plain HTTP `GET`/`HEAD` requests and serves them via native Worker `fetch()` calls to maximize throughput and conserve raw socket slots.
