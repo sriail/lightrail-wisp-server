@@ -34,6 +34,15 @@ Because Cloudflare Workers enforce strict per-invocation limits (such as a maxim
 * **High-Concurrency Serverless Relays:** Environments where standard serverless functions would hit connection-limit errors, utilizing `wisp-rs`'s built-in queueing and backpressure (`CONTINUE` / `0x49` throttling) to keep clients stable.
 * **Private-Relay Use:** Usage in establishing a private relay for proxys such as scramjet to avoid trafic veiwing on public wisp servers (or use in other wisp projects)
 
+> [!NOTE]
+> If you like or decide to use this project, feel free to give it a **Star**!
+
+---
+
+## Deployment
+
+Since this is a **Cloudflare Workers** Project, it is expected that you have a cloudflare account.
+
 ---
 
 ## Client Compatibility
