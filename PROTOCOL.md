@@ -1,4 +1,4 @@
-# Wisp-CF — Wisp v1.2 for Cloudflare Workers (WSS in, TCP + HTTP GET out, queued)
+# Wisp-CF — Wisp v1.2 for Cloudflare Workers 
 
 Based on Wisp v1.2 by [@ading2210](https://github.com/ading2210). Packet layouts, the WebSocket
 transport and their semantics are unchanged unless listed below. All integers are little-endian.
