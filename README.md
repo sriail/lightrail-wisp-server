@@ -8,7 +8,7 @@
 
 ## Core Premise
 
-**wisp-rs** is a Rust implementation of the **Wisp-CF** profile—an adaptation of the [Wisp v1.2 protocol](https://github.com/MercuryWorkshop/wisp-protocol) (originally by `@ading2210`) engineered specifically to operate within the architectural and runtime constraints of **Cloudflare Workers**.
+**wisp-rs** is a Rust implementation of the **Wisp-CF** profile—an adaptation of the [Wisp v1.2 protocol](https://github.com/MercuryWorkshop/wisp-protocol) (originally by `@ading2210`) engineered specifically to operate within the architectural and runtime constraints of **Cloudflare Workers** (you can view the full spec in [PROTOCOL.md](./PROTOCOL.md)).
 
 Because Cloudflare Workers enforce strict per-invocation limits (such as a maximum of 6 simultaneous outbound connections, subrequest caps, and no raw UDP sockets), standard Wisp servers fail under real-world concurrency. **wisp-rs** solves this by splitting traffic into smart execution lanes, transparently queueing excess connections instead of dropping them, and managing subrequest budgets gracefully.
 
