@@ -1,7 +1,7 @@
 <div align="center">
  <img src="./wisp-rs.svg" alt="wisp-rs logo" width="200" />
   <h1><strong>wisp-rs</strong></h1>
-  <p><strong>Wisp v1.2 for Cloudflare Workers (WSS in, TCP + HTTP GET out, queued)</strong></p>
+  <p><strong>Wisp v1.2 for Cloudflare Workers</strong></p>
 </div>
 
 ---
@@ -15,7 +15,7 @@ Because Cloudflare Workers enforce strict per-invocation limits (such as a maxim
 ### Architectural Adaptations Compared to Alternative Projects
 * **WSS-Only Inbound:** Accepts connections strictly over WebSocket over TLS (`wss://`).
 * **Dual-Lane Routing:** 
-  * **HTTP Lane (Ports 80 & 443):** Intercepts plain HTTP `GET`/`HEAD` requests and serves them via native Worker `fetch()` calls to maximize throughput and conserve raw socket slots.
+  * **HTTP Lane (Ports 80 & 443):** Intercepts plain HTTP `GET`/`HEAD` requests and serves them via native Worker `fetch()` calls to maximize throughput and conserve raw socket slots while using edge compute to make it significantly faster than its more traditional counterparts.
   * **TCP Lane (All Other Ports & TLS Fallback):** Uses Cloudflare's `connect()` socket API to forward raw, opaque TCP bytes. Client-side TLS (such as `epoxy-tls` or `libcurl.js`) is passed through untouched without server-side termination.
 * **Smart Concurrency & Queueing:** Enforces Cloudflare's 6-connection ceiling per WebSocket session (defaulting to 4 HTTP fetch slots and 2 TCP socket slots with idle slot borrowing) backed by a round-robin bounded queue so concurrent streams don't starve or fail abruptly.
 * **No UDP:** UDP (`0x02`) is unsupported and rejected cleanly with `CLOSE 0x41`.
