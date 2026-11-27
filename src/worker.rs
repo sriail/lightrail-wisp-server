@@ -706,6 +706,7 @@ struct SessionState {
     subrequests: u32,
     queue_high_water: u32,
     rotate_pending: bool,
+    total_streams_opened: u32,
 }
 
 // --- Notify primitive ------------------------------------------------------
@@ -1500,6 +1501,7 @@ impl SessionRunner {
     async fn run(self, events: worker::EventStream<'_>) {
         let SessionRunner { cfg, state, scheduler, hub_tx, ws, ws_closed, session_over } = self;
         let mut events = events;
+        console_error!("[wisp] session started: buffer_size={}", cfg.buffer_size);
         // first message: CONTINUE sid 0 with BUFFER_SIZE
         hub_tx.push(HubEvent::Continue(0, cfg.buffer_size));
         // scheduler dispatch loop
@@ -1530,11 +1532,13 @@ impl SessionRunner {
                 Ok(WebsocketEvent::Message(msg)) => {
                     if let Some(bytes) = msg.bytes() {
                         if bytes.len() < 5 {
+                            console_error!("[wisp] ws close 1002: frame too small ({} bytes)", bytes.len());
                             let _ = ws_handle.clone().close(Some(1002), Some::<&str>("frame too small"));
                             ws_closed.set(true);
                             break;
                         }
                         if bytes.len() as u64 > cfg.max_frame_bytes {
+                            console_error!("[wisp] ws close 1009: frame {} bytes exceeds {}", bytes.len(), cfg.max_frame_bytes);
                             let _ = ws_handle.clone().close(Some(1009), Some::<&str>("frame too large"));
                             ws_closed.set(true);
                             break;
@@ -1542,6 +1546,7 @@ impl SessionRunner {
                         let p = parse_packet(&bytes).unwrap();
                         dispatch_packet(&cfg, &state, &scheduler, &hub_tx, p.t, p.sid, p.payload);
                     } else if msg.text().is_some() {
+                        console_error!("[wisp] ws close 1003: text message received");
                         let _ = ws_handle.clone().close(Some(1003), Some::<&str>("binary frames only"));
                         ws_closed.set(true);
                         break;
@@ -1555,6 +1560,15 @@ impl SessionRunner {
         // final cleanup: cancel everything and close the server side of the pair
         ws_closed.set(true);
         state.borrow_mut().cancelled = true;
+        let st = state.borrow();
+        console_error!(
+            "[wisp] session ended: streams_opened_total={} streams_remaining={} subrequests={} queue_high_water={}",
+            st.total_streams_opened,
+            st.streams.len(),
+            st.subrequests,
+            st.queue_high_water
+        );
+        drop(st);
         let _ = ws_handle.close(Some(1000), Some::<&str>("session end"));
         session_over.notify();
     }
@@ -1613,6 +1627,14 @@ fn dispatch_packet(
             }
             let host_s = String::from_utf8_lossy(host).trim().to_string();
             let lane = if cfg.http_lane_ports.contains(&port) { Lane::Http } else { Lane::Tcp };
+            console_error!(
+                "[wisp] stream open: sid={} lane={} {}:{}",
+                sid,
+                if lane == Lane::Http { "http" } else { "tcp" },
+                host_s,
+                port
+            );
+            st.total_streams_opened += 1;
             let now = now_ms();
             st.streams.insert(
                 sid,
@@ -1794,7 +1816,9 @@ fn dispatch_packet(
         T_CLOSE => {
             // client CLOSE for a stream: tear it down; the server sends no CLOSE back
             let mut st = state.borrow_mut();
-            st.streams.remove(&sid);
+            if st.streams.remove(&sid).is_some() {
+                console_error!("[wisp] stream closed by client: sid={}", sid);
+            }
         }
         _ => {
             // unknown packet type: ignore
@@ -1846,62 +1870,82 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return json_error(403, "wss only: non-TLS request refused");
     }
     if req.method() != worker::Method::Get {
+        console_error!("[wisp] 405: method {} to {}", req.method(), path);
         return json_error(405, "method not allowed");
     }
-    if path == "/" {
-        return status_response(&cfg);
-    }
-    // Wisp path (+ optional secret segment), constant-time compared when set
+
+    // --- WebSocket upgrade detection FIRST: an upgrade request must never fall into the
+    // plain-HTTP branches (that ordering produced the 200-instead-of-101 handshake failure). ---
+    let upgrade_header = req
+        .headers()
+        .get("Upgrade")
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        .to_lowercase();
+    let wants_ws = upgrade_header.split(',').any(|p| p.trim() == "websocket");
+
+    // Accepted Wisp endpoints: the configured WISP_PATH (default /wisp/) and, for clients that
+    // configure the Wisp URL at the root (e.g. Scramjet's epoxy transport), the root path.
     let wisp_path = if cfg.wisp_path.ends_with('/') {
         cfg.wisp_path.clone()
     } else {
         format!("{}/", cfg.wisp_path)
     };
     let is_wisp = match &cfg.wisp_secret {
-        Some(secret) => {
-            // secret is the path segment after WISP_PATH
-            match path.strip_prefix(&wisp_path) {
-                Some(rest) => {
-                    let seg = rest.trim_end_matches('/');
-                    constant_time_eq(seg, secret)
-                }
-                None => false,
+        Some(secret) => match path.strip_prefix(&wisp_path) {
+            Some(rest) => {
+                let seg = rest.trim_end_matches('/');
+                constant_time_eq(seg, secret)
+            }
+            None => false,
+        },
+        None => path == wisp_path || path == "/" || path.is_empty(),
+    };
+
+    if wants_ws {
+        // ---- WebSocket upgrade path ----
+        if !is_wisp {
+            console_error!("[wisp] 404: upgrade to non-Wisp path {}", path);
+            return json_error(404, "not found");
+        }
+        if !cfg.allowed_origins.is_empty() {
+            let origin = req
+                .headers()
+                .get("Origin")
+                .ok()
+                .flatten()
+                .map(|o| o.to_lowercase())
+                .unwrap_or_default();
+            if origin.is_empty() || !cfg.allowed_origins.iter().any(|a| origin == *a) {
+                console_error!("[wisp] 403: upgrade rejected, origin not allowed");
+                return json_error(403, "origin not allowed");
             }
         }
-        None => path == wisp_path,
-    };
-    if !is_wisp {
-        return json_error(404, "not found");
-    }
-    // origin allowlist
-    if !cfg.allowed_origins.is_empty() {
-        let origin = req
-            .headers()
-            .get("Origin")
-            .ok()
-            .flatten()
-            .map(|o| o.to_lowercase())
-            .unwrap_or_default();
-        if origin.is_empty() || !cfg.allowed_origins.iter().any(|a| origin == *a) {
-            return json_error(403, "origin not allowed");
-        }
-    }
-    // upgrade check
-    let wants_ws = req
-        .headers()
-        .get("Upgrade")
-        .ok()
-        .flatten()
-        .map(|u| u.to_lowercase().contains("websocket"))
-        .unwrap_or(false);
-    if !wants_ws {
-        return json_error(426, "upgrade required");
+        console_error!("[wisp] ws upgrade accepted: path={} starting session", path);
+        return wisp_session(cfg);
     }
 
+    // ---- plain HTTP branches (only reached when NOT an upgrade) ----
+    if path == "/" || path.is_empty() {
+        return status_response(&cfg);
+    }
+    if is_wisp {
+        console_error!("[wisp] 426: non-upgrade GET to Wisp path {}", path);
+        return json_error(426, "upgrade required");
+    }
+    console_error!("[wisp] 404: {}", path);
+    json_error(404, "not found")
+}
+
+/// Accept the WebSocket pair, register the Wisp session handlers, and return the 101
+/// with the client side of the pair attached.
+fn wisp_session(cfg: Rc<Config>) -> Result<Response> {
     // create the pair and hand the client side back in the 101
     let pair = WebSocketPair::new()?;
     let (client, server) = (pair.client, pair.server);
     server.accept()?;
+    console_error!("[wisp] 101: WebSocketPair created, server side accepted");
 
     let state: Shared<SessionState> = Rc::new(RefCell::new(SessionState {
         streams: Default::default(),
@@ -1909,6 +1953,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         subrequests: 0,
         queue_high_water: 0,
         rotate_pending: false,
+        total_streams_opened: 0,
     }));
     let ws_closed = Rc::new(Cell::new(false));
     let mut hub_tx = HubTx::new(&cfg);
@@ -1944,6 +1989,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // the same object it listens on. Give the session the moved server itself.
         session.run_with_server(server).await;
     });
+    console_error!("[wisp] session live: hub + scheduler + message loop spawned");
 
     Response::from_websocket(client)
 }
