@@ -32,7 +32,7 @@ Because Cloudflare Workers enforce strict per-invocation limits (such as a maxim
 * **Edge-Hosted Browser Proxies:** Powering client-side web proxy frontends (like `epoxy-tls` and `libcurl.js`) globally on Cloudflare's edge network without managing traditional VPS infrastructure.
 * **Lightweight TCP/HTTP Tunneling:** Multiplexing multiple outbound TCP and HTTP/1.x streams over a single TLS-encrypted WebSocket connection.
 * **High-Concurrency Serverless Relays:** Environments where standard serverless functions would hit connection-limit errors, utilizing `wisp-rs`'s built-in queueing and backpressure (`CONTINUE` / `0x49` throttling) to keep clients stable.
-* **Private-Relay Use** Usage in establishing a private relay for proxys such as scramjet to avoid trafic veiwing on public wisp servers (or use in other wisp projects)
+* **Private-Relay Use:** Usage in establishing a private relay for proxys such as scramjet to avoid trafic veiwing on public wisp servers (or use in other wisp projects)
 
 ---
 
