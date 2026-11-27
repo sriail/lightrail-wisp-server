@@ -1,10 +1,11 @@
+
 name = "wisp-rs"
 main = "build/worker/shim.mjs"
 compatibility_date = "2024-11-01"
 workers_dev = true
 
 [build]
-command = "cargo install -q worker-build@0.1.14 && worker-build --release"
+command = 'curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal && . "$HOME/.cargo/env" && rustup target add wasm32-unknown-unknown && cargo install --locked worker-build --version 0.1.14 && worker-build --release'
 
 [observability]
 enabled = true
